@@ -15,6 +15,7 @@ from ocimgr.core import (
     AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder, 
     register_resource_type, AsyncOCISession, OperationResult, ResourceStatus
 )
+from ocimgr.utils import run_with_backoff
 
 
 @register_resource_type
@@ -36,10 +37,13 @@ class ComputeInstance(AbstractOCIResource, AsyncResourceMixin):
                 compute_client = await session.get_client('compute', region)
                 
                 # Run list operation in thread pool
-                list_instances_response = await cls._run_oci_operation(
-                    compute_client.list_instances,
-                    compartment_id=compartment_id
-                )
+                async def list_operation():
+                    return await cls._run_oci_operation(
+                        compute_client.list_instances,
+                        compartment_id=compartment_id
+                    )
+
+                list_instances_response = await run_with_backoff(list_operation)
                 
                 for instance in list_instances_response.data:
                     # Skip terminated instances

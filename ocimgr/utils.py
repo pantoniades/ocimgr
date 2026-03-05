@@ -19,9 +19,12 @@ import oci
 import socket
 
 try:
-    from urllib3.exceptions import ReadTimeoutError
+    from urllib3.exceptions import ReadTimeoutError, ProtocolError, MaxRetryError, SSLError
 except Exception:  # pragma: no cover - fallback when urllib3 isn't available
-    ReadTimeoutError = ()
+    ReadTimeoutError = type(None)
+    ProtocolError = type(None)
+    MaxRetryError = type(None)
+    SSLError = type(None)
 
 # Third-party imports for progress bar
 try:
@@ -464,10 +467,38 @@ def is_auth_error(error: Exception) -> bool:
 
 def is_transient_network_error(error: Exception) -> bool:
     """Return True for retryable network errors (timeouts, connection resets)."""
+    # Handle tuple format from OCI SDK
+    if isinstance(error, tuple) and len(error) >= 1:
+        error = error[0]
+    
     if ReadTimeoutError and isinstance(error, ReadTimeoutError):
         return True
+    if ProtocolError and isinstance(error, ProtocolError):
+        return True
+    if MaxRetryError and isinstance(error, MaxRetryError):
+        return True
+    if SSLError and isinstance(error, SSLError):
+        return True
+    # Fallback for when urllib3 not available: check class name
+    if hasattr(error, '__class__') and hasattr(error.__class__, '__name__'):
+        class_name = error.__class__.__name__
+        if class_name in ('ProtocolError', 'ReadTimeoutError', 'MaxRetryError', 'SSLError'):
+            return True
     if isinstance(error, socket.timeout):
         return True
+    if isinstance(error, ConnectionResetError):
+        return True
+    if isinstance(error, ConnectionAbortedError):
+        return True
+    # unwrap OCI request exceptions that may wrap network errors
+    if isinstance(error, oci.exceptions.RequestException):
+        cause = getattr(error, '__cause__', None)
+        if cause and is_transient_network_error(cause):
+            return True
+        # sometimes args contain tuple with ProtocolError
+        for arg in error.args:
+            if isinstance(arg, tuple) and arg and isinstance(arg[0], ProtocolError):
+                return True
     return False
 
 

@@ -15,6 +15,7 @@ from ..core import (
     AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder, 
     register_resource_type, AsyncOCISession, OperationResult, ResourceStatus
 )
+from ..utils import run_with_backoff
 
 
 @register_resource_type
@@ -36,10 +37,13 @@ class OKECluster(AbstractOCIResource, AsyncResourceMixin):
                 container_client = await session.get_client('container_engine', region)
                 
                 # Run list operation in thread pool
-                list_response = await cls._run_oci_operation(
-                    container_client.list_clusters,
-                    compartment_id=compartment_id
-                )
+                async def list_operation():
+                    return await cls._run_oci_operation(
+                        container_client.list_clusters,
+                        compartment_id=compartment_id
+                    )
+
+                list_response = await run_with_backoff(list_operation)
                 
                 for cluster in list_response.data:
                     # Skip deleted/deleting clusters

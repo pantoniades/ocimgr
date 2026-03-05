@@ -454,6 +454,9 @@ class ResourceDiscoveryEngine:
         
         Returns:
             Dictionary mapping compartment_id to list of resources
+        
+        Raises:
+            RuntimeError: If circuit breaker opens (rate limit exhausted)
         """
         # Filter resource types if specified
         types_to_discover = self.resource_types
@@ -464,6 +467,7 @@ class ResourceDiscoveryEngine:
             }
         
         all_resources = {}
+        circuit_open_error = None
         
         # Discover resources for each compartment
         for compartment_id in compartment_ids:
@@ -476,7 +480,8 @@ class ResourceDiscoveryEngine:
                 task = self._discover_resource_type(
                     resource_class, 
                     compartment_id, 
-                    resource_type_name
+                    resource_type_name,
+                    skip_unauthorized=skip_unauthorized
                 )
                 discovery_tasks.append(task)
             
@@ -494,7 +499,13 @@ class ResourceDiscoveryEngine:
                     case list():  # Empty list
                         logging.debug(f"  No {resource_type_name} found")
                     case Exception() as e:
-                        if skip_unauthorized and getattr(e, "status", None) == 401:
+                        # Check if circuit breaker has opened (rate limiting cascade)
+                        error_str = str(e)
+                        if "Circuit" in error_str and "OPEN" in error_str:
+                            logging.error(f"Circuit breaker opened due to excessive failures: {e}")
+                            circuit_open_error = e
+                            # Continue to preserve further error context
+                        elif skip_unauthorized and getattr(e, "status", None) == 401:
                             logging.warning(f"  Skipping unauthorized {resource_type_name} discovery: {e}")
                         else:
                             logging.error(f"  Error discovering {resource_type_name}: {e}")
@@ -502,13 +513,18 @@ class ResourceDiscoveryEngine:
             all_resources[compartment_id] = compartment_resources
             logging.info(f"  Total: {len(compartment_resources)} resources in compartment")
         
+        # If circuit breaker opened, propagate it so caller can handle gracefully
+        if circuit_open_error:
+            raise RuntimeError(f"Service rate limited - circuit breaker open: {circuit_open_error}")
+        
         return all_resources
     
     async def _discover_resource_type(
         self, 
         resource_class: Type[AbstractOCIResource], 
         compartment_id: str,
-        resource_type_name: str
+        resource_type_name: str,
+        skip_unauthorized: bool = False
     ) -> List[AbstractOCIResource]:
         """
         Discover resources of a specific type with error handling.
@@ -521,13 +537,30 @@ class ResourceDiscoveryEngine:
         Returns:
             List of discovered resources
         """
+        # Call the discovery implementation and centrally handle authorization skips.
         try:
-            resources = await resource_class.discover(self.session, compartment_id)
+            try:
+                resources = await resource_class.discover(self.session, compartment_id, skip_unauthorized=skip_unauthorized)
+            except TypeError:
+                # older implementations may not support the parameter
+                resources = await resource_class.discover(self.session, compartment_id)
+
             # Set session for all discovered resources
             for resource in resources:
                 resource.set_session(self.session)
             return resources
+
         except Exception as e:
+            # If caller requested to skip unauthorized, quietly return no resources when a 401 occurs.
+            try:
+                status = getattr(e, 'status', None)
+            except Exception:
+                status = None
+
+            if skip_unauthorized and status == 401:
+                logging.debug(f"Skipping unauthorized {resource_type_name} discovery in {compartment_id}: {e}")
+                return []
+
             logging.error(f"Discovery failed for {resource_type_name} in {compartment_id}: {e}")
             raise
 

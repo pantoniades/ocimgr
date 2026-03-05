@@ -4,7 +4,45 @@ OCIMgr - Oracle Cloud Infrastructure Management Tool
 
 # OCIMgr
 
-OCIMgr is a Python CLI for discovering OCI resources across compartments and regions. It focuses on **inventory discovery** and **safe cleanup workflows** to help you find unused resources and reduce spend.
+
+# OCIMgr
+
+OCIMgr is a small toolkit for discovering and managing Oracle Cloud Infrastructure (OCI) resources asynchronously.
+
+Quick start
+-----------
+
+1. Create a virtual environment and install dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+# install test deps
+pip install pytest pytest-asyncio
+```
+
+2. Run the CLI (example):
+
+```bash
+# after installing package (editable) or running via python -m
+python -m ocimgr.cli inventory --compartment-list ./all-compartments.txt
+```
+
+Testing
+-------
+
+Run unit tests with pytest:
+
+```bash
+pytest -q
+```
+
+Notes
+-----
+- The project relies on OCI config and credentials. See OCI SDK documentation for configuring `~/.oci/config`.
+- The tests in `tests/` are lightweight and use mocks to avoid network calls.
+
 
 ## ✅ Features (Current Scope)
 - Multi-region discovery (async)

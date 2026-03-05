@@ -20,6 +20,7 @@ from dataclasses import asdict
 from enum import Enum
 import click
 import oci
+import random
 
 # Use ABSOLUTE imports instead of relative imports
 from ocimgr.core import (
@@ -1507,6 +1508,8 @@ async def resources_command(ctx, compartment_numbers, format, output, types, ski
 @click.option('--format', '-f', type=click.Choice(['table', 'json', 'csv']),
               default='table', help='Output format')
 @click.option('--output', '-o', help='Save output to file')
+@click.option('--compartment-list', type=click.Path(dir_okay=False),
+              help='Write qualified compartment list (comments + OCIDs) to file')
 @click.option('--compartment', '-c', help='Compartment name to scope (includes sub-compartments)')
 @click.option('--types', '-t', help='Resource types to include (comma-separated)')
 @click.option('--max-concurrent', type=int, default=1, help='Max concurrent API calls per compartment')
@@ -1521,6 +1524,7 @@ async def inventory_command(
     ctx,
     format,
     output,
+    compartment_list,
     compartment,
     types,
     max_concurrent,
@@ -1609,7 +1613,44 @@ async def inventory_command(
             resource_type_filter = [t.strip() for t in types.split(',') if t.strip()]
 
         compartment_ids = [comp['id'] for comp in scoped_compartments]
-        compartment_names = {comp['id']: comp['name'] for comp in scoped_compartments}
+        parent_map = {comp['id']: comp.get('parent_id') for comp in all_compartments}
+        name_map = {comp['id']: comp['name'] for comp in all_compartments}
+
+        def build_compartment_path(compartment_id: str) -> str:
+            path_parts = []
+            current_id = compartment_id
+            while current_id:
+                name = name_map.get(current_id, current_id)
+                path_parts.append(name)
+                parent_id = parent_map.get(current_id)
+                if not parent_id or parent_id == current_id:
+                    break
+                current_id = parent_id
+            return "/".join(reversed(path_parts))
+
+        compartment_names = {
+            comp_id: build_compartment_path(comp_id)
+            for comp_id in compartment_ids
+        }
+
+        if compartment_list:
+            list_lines = [
+                "# Qualified compartment list (path then OCID)",
+                "# Edit as needed and pass to delete-compartment --targets-file"
+            ]
+            for comp in scoped_compartments:
+                display_name = compartment_names.get(comp['id'], comp['name'])
+                list_lines.append(f"# {display_name}")
+                list_lines.append(comp['id'])
+                list_lines.append("")
+
+            list_path = Path(compartment_list).expanduser().resolve()
+            try:
+                list_path.parent.mkdir(parents=True, exist_ok=True)
+                list_path.write_text("\n".join(list_lines).rstrip() + "\n", encoding="utf-8")
+                click.echo(f"📝 Compartment list written to {list_path}")
+            except Exception as exc:
+                click.echo(f"❌ Failed to write compartment list to {list_path}: {exc}")
 
         click.echo(
             f"🔍 Scanning {len(compartment_ids)} compartments across "
@@ -1650,19 +1691,22 @@ async def inventory_command(
 
         # Build rows for output
         rows = []
+        totals_by_type: Dict[str, int] = {}
         for comp in scoped_compartments:
             comp_counts = counts_by_compartment.get(comp['id'], {})
+            display_name = compartment_names.get(comp['id'], comp['name'])
             for resource_type, payload in comp_counts.items():
                 count = payload.get("count", 0)
                 regions = payload.get("regions", [])
                 if count == 0 and not list_empty:
                     continue
                 rows.append({
-                    "compartment": comp['name'],
+                    "compartment": display_name,
                     "resource_type": resource_type,
                     "count": count,
                     "regions": ", ".join(regions)
                 })
+                totals_by_type[resource_type] = totals_by_type.get(resource_type, 0) + count
 
         if not rows:
             click.echo("📭 No resources found in selected scope.")
@@ -1684,23 +1728,53 @@ async def inventory_command(
         else:
             click.echo(content)
 
+        if totals_by_type:
+            click.echo("\n📊 Totals by resource type:")
+            for resource_type, count in sorted(totals_by_type.items()):
+                click.echo(f"  • {resource_type}: {count}")
+
     finally:
         await cli_app.cleanup()
 
 
 @cli.command("delete-compartment")
-@click.argument('target')
+@click.argument('targets', nargs=-1, required=False)
+@click.option('--targets-file', type=click.Path(exists=True, dir_okay=False),
+              help='Path to a file containing one compartment name/OCID per line')
+@click.option('--remaining-file', type=click.Path(dir_okay=False),
+              help='Write remaining (not deleted) targets to this file')
 @click.option('--dry-run', is_flag=True, help='Show deletion plan only (no changes)')
 @click.option('--yes', is_flag=True, help='Skip confirmation prompts')
 @click.option('--max-concurrent', type=int, default=3, help='Max concurrent API calls per compartment')
+@click.option('--delete-retry-max', type=int, default=6, help='Max delete retries when throttled')
+@click.option('--delete-retry-base-delay', type=float, default=0.75, help='Base delay (seconds) for delete backoff')
+@click.option('--delete-retry-max-delay', type=float, default=12.0, help='Max delay (seconds) for delete backoff')
+@click.option('--compartment-delay', type=float, default=0.0, help='Delay (seconds) between compartment deletes')
+@click.option('--target-delay', type=float, default=0.0, help='Delay (seconds) between target compartments')
 @click.option('--discover-regions', is_flag=True, help='Rebuild cached regions from OCI')
 @click.option('--skip-unauthorized', is_flag=True, help='Skip 401 unauthorized regions')
 @click.option('--verbose', '-v', is_flag=True, help='Verbose output')
 @click.pass_context
 @async_command
-async def delete_compartment_command(ctx, target, dry_run, yes, max_concurrent, discover_regions, skip_unauthorized, verbose):
+async def delete_compartment_command(
+    ctx,
+    targets,
+    targets_file,
+    remaining_file,
+    dry_run,
+    yes,
+    max_concurrent,
+    delete_retry_max,
+    delete_retry_base_delay,
+    delete_retry_max_delay,
+    compartment_delay,
+    target_delay,
+    discover_regions,
+    skip_unauthorized,
+    verbose
+):
     """
-    🗑️ Delete a compartment by OCID or name (includes subtree).
+    🗑️ Delete one or more compartments by OCID or name (includes subtree).
     Finds resources, disables delete protection, and deletes in dependency order.
     """
     cli_app = OCIMgrAsyncCLI(
@@ -1711,6 +1785,26 @@ async def delete_compartment_command(ctx, target, dry_run, yes, max_concurrent, 
 
     try:
         await cli_app.initialize()
+
+        file_targets: List[str] = []
+        if targets_file:
+            try:
+                targets_path = Path(targets_file)
+                file_targets = [
+                    line.strip() for line in targets_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+            except Exception as e:
+                click.echo(f"❌ Failed to read targets file {targets_file}: {e}")
+                return
+
+        combined_targets = list(targets) + file_targets
+        combined_targets = [t.strip() for t in combined_targets if t.strip()]
+
+        if not combined_targets:
+            click.echo("❌ No compartment targets provided.")
+            click.echo("💡 Provide targets as arguments or with --targets-file")
+            return
 
         click.echo("🌍 Resolving regions (cache/subscriptions)...")
         cache_path = get_region_cache_path(ctx.obj.get('config'))
@@ -1737,27 +1831,54 @@ async def delete_compartment_command(ctx, target, dry_run, yes, max_concurrent, 
             click.echo("📭 No compartments found.")
             return
 
-        target_compartment = None
-        if target.startswith("ocid1.compartment"):
-            target_compartment = next(
-                (comp for comp in all_compartments if comp['id'] == target),
-                None
-            )
-        else:
-            search_term = target.lower()
-            matches = [
-                comp for comp in all_compartments
-                if search_term in comp['name'].lower()
-            ]
-            if matches:
-                matches.sort(
-                    key=lambda c: (c['name'].lower().startswith(search_term), c['name']),
-                    reverse=True
-                )
-                target_compartment = matches[0]
+        # validate all provided targets (OCIDs or names)
+        found = []
+        missing = []
+        
+        # helper to build fully qualified path
+        def get_qualified_path(compartment_id: str) -> str:
+            path = []
+            current = compartment_id
+            while current:
+                comp = next((c for c in all_compartments if c['id'] == current), None)
+                if comp:
+                    path.insert(0, comp['name'])
+                    current = comp.get('parent_id')
+                else:
+                    break
+            return '/'.join(path)
+        
+        # resolve each target (OCID or name) to a compartment object if possible
+        for target in combined_targets:
+            if target.startswith("ocid1.compartment"):
+                comp = next((c for c in all_compartments if c['id'] == target), None)
+                if comp:
+                    found.append(comp)
+                else:
+                    missing.append(target)
+            else:
+                term = target.lower()
+                matches = [c for c in all_compartments if term in c['name'].lower()]
+                if matches:
+                    matches.sort(key=lambda c: (c['name'].lower().startswith(term), c['name']), reverse=True)
+                    found.append(matches[0])
+                else:
+                    missing.append(target)
 
-        if not target_compartment:
-            click.echo(f"❌ Compartment '{target}' not found.")
+        if found:
+            click.echo("\n🔐 Validating specified compartments:")
+            click.echo("The following compartments will be targeted for deletion:")
+            for comp in found:
+                qualified_path = get_qualified_path(comp['id'])
+                click.echo(f"  • {qualified_path}")
+        if missing:
+            click.echo("\n⚠️  The following targets were not found and will be skipped:")
+            for t in missing:
+                click.echo(f"  • {t}")
+
+        # always ask once before proceeding regardless of --yes; --yes only skips later prompts
+        if not click.confirm(f"Continue with deletion of {len(found)} found compartments?", default=False):
+            click.echo("❌ Operation cancelled.")
             return
 
         parent_map = {comp['id']: comp.get('parent_id') for comp in all_compartments}
@@ -1769,58 +1890,6 @@ async def delete_compartment_command(ctx, target, dry_run, yes, max_concurrent, 
                     return True
                 current = parent_map.get(current)
             return False
-
-        scoped_compartments = [
-            comp for comp in all_compartments
-            if is_descendant(comp['id'], target_compartment['id'])
-        ]
-
-        click.echo(
-            f"🎯 Target compartment: {target_compartment['name']}"
-            f" ({len(scoped_compartments)} compartments in subtree)"
-        )
-
-        compartment_ids = [comp['id'] for comp in scoped_compartments]
-
-        click.echo("🔍 Discovering resources for deletion plan...")
-        resources_by_compartment = await cli_app.discover_resources(
-            compartment_ids,
-            skip_unauthorized=skip_unauthorized
-        )
-
-        all_resources = []
-        for resources in resources_by_compartment.values():
-            all_resources.extend(resources)
-
-        if not all_resources:
-            click.echo("📭 No resources found in selected compartments.")
-        else:
-            deletion_plan = await cli_app.create_deletion_plan(all_resources)
-
-            if dry_run:
-                click.echo("🧪 Dry run mode enabled - no changes will be made.")
-            elif not yes:
-                if not click.confirm(
-                    f"Proceed to delete {len(deletion_plan)} resources across "
-                    f"{len(scoped_compartments)} compartments?"
-                ):
-                    click.echo("❌ Operation cancelled.")
-                    return
-
-            if not dry_run:
-                await cli_app.execute_deletion(deletion_plan, dry_run=False)
-
-        if dry_run:
-            click.echo("🧪 Dry run complete. No resources were deleted.")
-            return
-
-        if not yes:
-            if not click.confirm(
-                f"Delete {len(scoped_compartments)} compartments after cleanup?",
-                default=False
-            ):
-                click.echo("❌ Compartment deletion cancelled.")
-                return
 
         home_region = None
         try:
@@ -1841,18 +1910,286 @@ async def delete_compartment_command(ctx, target, dry_run, yes, max_concurrent, 
         if verbose:
             click.echo(f"🏠 Using home region for compartment deletes: {delete_region}")
 
-        click.echo("🗑️ Deleting compartments (leaf to root)...")
         delete_success = True
-        for comp in reversed(scoped_compartments):
-            if comp['id'] == target_compartment['id'] or comp.get('parent_id'):
-                success = await cli_app.compartment_manager.delete_compartment(
-                    comp['id'],
-                    region=delete_region
-                )
-                if not success:
-                    delete_success = False
-                    click.echo(f"❌ Failed to delete compartment {comp['name']}")
+        deleted_count = 0
+        failed_count = 0
 
+        remaining_targets = []
+        for target in combined_targets:
+            target_compartment = None
+            if target.startswith("ocid1.compartment"):
+                target_compartment = next(
+                    (comp for comp in all_compartments if comp['id'] == target),
+                    None
+                )
+            else:
+                search_term = target.lower()
+                matches = [
+                    comp for comp in all_compartments
+                    if search_term in comp['name'].lower()
+                ]
+                if matches:
+                    matches.sort(
+                        key=lambda c: (c['name'].lower().startswith(search_term), c['name']),
+                        reverse=True
+                    )
+                    target_compartment = matches[0]
+
+            if not target_compartment:
+                click.echo(f"❌ Compartment '{target}' not found.")
+                delete_success = False
+                remaining_targets.append(target)
+                continue
+
+            scoped_compartments = [
+                comp for comp in all_compartments
+                if is_descendant(comp['id'], target_compartment['id'])
+            ]
+
+            def get_depth(compartment_id: str) -> int:
+                depth = 0
+                current = compartment_id
+                while current and current in parent_map:
+                    parent_id = parent_map.get(current)
+                    if not parent_id or parent_id == current:
+                        break
+                    depth += 1
+                    current = parent_id
+                return depth
+
+            scoped_compartments = sorted(
+                scoped_compartments,
+                key=lambda comp: get_depth(comp['id']),
+                reverse=True
+            )
+
+            logging.info(
+                f"Processing target compartment {target_compartment['name']} with {len(scoped_compartments)} total in subtree"
+            )
+            click.echo(
+                f"🎯 Target compartment: {target_compartment['name']}"
+                f" ({len(scoped_compartments)} compartments in subtree)"
+            )
+
+            compartment_ids = [comp['id'] for comp in scoped_compartments]
+
+            click.echo("🔍 Discovering resources for deletion plan...")
+
+            async def attempt_discovery(retries:int=3) -> dict:
+                """Try discovery repeatedly when we hit rate limits or circuits.
+
+                Returns the resources dict on success or raises on final failure.
+                """
+                nonlocal max_concurrent
+                for attempt in range(1, retries+1):
+                    try:
+                        return await cli_app.discover_resources(
+                            compartment_ids,
+                            skip_unauthorized=skip_unauthorized
+                        )
+                    except Exception as ee:
+                        errstr = str(ee)
+                        if "Circuit" in errstr or "429" in errstr:
+                            click.echo(f"⚠️  Service rate limited or circuit open (attempt {attempt}): {ee}")
+                            # reduce concurrency on either event to slow overall pace
+                            new_max = max(1, max_concurrent - 1)
+                            if new_max < max_concurrent:
+                                click.echo(f"⚠️  Reducing --max-concurrent from {max_concurrent} to {new_max} due to throttling/circuit")
+                                logging.warning(f"Concurrency reduced: {max_concurrent} → {new_max} due to {errstr[:80]}" )
+                                max_concurrent = new_max
+                            # pause before retrying
+                            if attempt < retries:
+                                wait = 30
+                                click.echo(f"⏳  Pausing {wait}s before retrying discovery...")
+                                await asyncio.sleep(wait)
+                                continue
+                        # not a rate/circuit error or no retries left
+                        raise
+                # unreachable
+            
+            try:
+                resources_by_compartment = await attempt_discovery()
+            except Exception as e:
+                # final failure after retries
+                click.echo(f"⚠️  Still rate limited after retries: {e}")
+                click.echo(f"❌ Cannot proceed with compartment deletion. Remaining targets saved.")
+                remaining_targets.append(target)
+                delete_success = False
+                continue
+
+            all_resources = []
+            for resources in resources_by_compartment.values():
+                all_resources.extend(resources)
+
+            if not all_resources:
+                click.echo("📭 No resources found in selected compartments.")
+                click.echo("🗑️ Directly deleting empty compartments (no resource cleanup needed)...")
+                target_deleted = True
+                random.shuffle(scoped_compartments)
+                for index, comp in enumerate(scoped_compartments, start=1):
+                    click.echo(
+                        f"🔁 Deleting compartment {index} of {len(scoped_compartments)}: {comp.get('name','<unknown>')}"
+                    )
+                    # For empty compartments, skip resource deletion entirely
+                    if comp['id'] == target_compartment['id'] or comp.get('parent_id'):
+                        async def delete_operation() -> bool:
+                            return await cli_app.compartment_manager.delete_compartment(
+                                comp['id'],
+                                region=delete_region
+                            )
+
+                        try:
+                            success = await run_with_backoff(
+                                delete_operation,
+                                max_retries=delete_retry_max,
+                                base_delay=delete_retry_base_delay,
+                                max_delay=delete_retry_max_delay
+                            )
+                        except Exception as e:
+                            success = False
+                            error_str = str(e)
+                            if "429" in error_str:
+                                # Reduce concurrency on rate limit
+                                new_max = max(1, max_concurrent - 1)
+                                click.echo(f"⚠️  Rate limited (429). Reducing --max-concurrent from {max_concurrent} to {new_max}")
+                                logging.warning(f"Rate limit (429) detected. Reduced concurrency: {max_concurrent} → {new_max}")
+                                max_concurrent = new_max
+                                # pause briefly to allow throttling to ease
+                                click.echo("⏳  Sleeping 30s after rate limit before continuing")
+                                await asyncio.sleep(30)
+                            elif "Circuit" in error_str and "OPEN" in error_str:
+                                logging.error(f"Circuit breaker opened for compartment deletion: {error_str}")
+                                click.echo("⏳  Circuit breaker open; waiting 30s before next delete")
+                                await asyncio.sleep(30)
+                            if verbose:
+                                click.echo(f"⚠️  Retry exhausted for {comp['name']}: {e}")
+
+                        if success:
+                            deleted_count += 1
+                            logging.info(f"✅ Deleted compartment: {comp.get('name')} ({comp['id']})")
+                        else:
+                            delete_success = False
+                            target_deleted = False
+                            failed_count += 1
+                            click.echo(f"❌ Failed to delete compartment {comp['name']}")
+                            logging.warning(f"❌ Failed to delete compartment: {comp.get('name')} ({comp['id']})")
+
+                        if compartment_delay > 0 and index < len(scoped_compartments):
+                            await asyncio.sleep(compartment_delay)
+
+                if target_delay > 0:
+                    await asyncio.sleep(target_delay)
+
+                if not target_deleted:
+                    remaining_targets.append(target)
+                continue
+            else:
+                deletion_plan = await cli_app.create_deletion_plan(all_resources)
+                protected_resources = [r for r in deletion_plan if r.info.has_delete_protection]
+
+                if protected_resources:
+                    click.echo(
+                        f"🔒 {len(protected_resources)} resources have delete protection enabled."
+                    )
+                    for resource in protected_resources:
+                        click.echo(f"  • {resource.info.resource_type}: {resource.info.name}")
+
+                    if dry_run:
+                        click.echo("🧪 Dry run mode enabled - delete protection will NOT be disabled.")
+                    elif not yes:
+                        if not click.confirm(
+                            "Disable delete protection for these resources and continue?"
+                        ):
+                            click.echo("❌ Operation cancelled.")
+                            delete_success = False
+                            continue
+
+                if dry_run:
+                    click.echo("🧪 Dry run mode enabled - no changes will be made.")
+                elif not yes:
+                    if not click.confirm(
+                        f"Proceed to delete {len(deletion_plan)} resources across "
+                        f"{len(scoped_compartments)} compartments?"
+                    ):
+                        click.echo("❌ Operation cancelled.")
+                        delete_success = False
+                        continue
+
+                if not dry_run:
+                    await cli_app.execute_deletion(deletion_plan, dry_run=False)
+
+            if dry_run:
+                click.echo("🧪 Dry run complete. No resources were deleted.")
+                if target_delay > 0:
+                    await asyncio.sleep(target_delay)
+                remaining_targets.append(target)
+                continue
+
+            if not yes:
+                if not click.confirm(
+                    f"Delete {len(scoped_compartments)} compartments after cleanup?",
+                    default=False
+                ):
+                    click.echo("❌ Compartment deletion cancelled.")
+                    delete_success = False
+                    remaining_targets.append(target)
+                    continue
+
+            click.echo("🗑️ Deleting compartments (leaf to root, random order)...")
+            target_deleted = True
+            # randomize order to avoid hitting same regional issues repeatedly
+            random.shuffle(scoped_compartments)
+            for index, comp in enumerate(scoped_compartments, start=1):
+                # progress indicator
+                click.echo(
+                    f"🔁 Deleting compartment {index} of {len(scoped_compartments)}: {comp.get('name','<unknown>')}"
+                )
+                if comp['id'] == target_compartment['id'] or comp.get('parent_id'):
+                    async def delete_operation() -> bool:
+                        return await cli_app.compartment_manager.delete_compartment(
+                            comp['id'],
+                            region=delete_region
+                        )
+
+                    try:
+                        success = await run_with_backoff(
+                            delete_operation,
+                            max_retries=delete_retry_max,
+                            base_delay=delete_retry_base_delay,
+                            max_delay=delete_retry_max_delay
+                        )
+                    except Exception as e:
+                        success = False
+                        if verbose:
+                            click.echo(f"⚠️ Throttling retry exhausted for {comp['name']}: {e}")
+
+                    if success:
+                        deleted_count += 1
+                    else:
+                        delete_success = False
+                        target_deleted = False
+                        failed_count += 1
+                        click.echo(f"❌ Failed to delete compartment {comp['name']}")
+
+                    if compartment_delay > 0 and index < len(scoped_compartments):
+                        await asyncio.sleep(compartment_delay)
+
+            if target_delay > 0:
+                await asyncio.sleep(target_delay)
+
+            if not target_deleted:
+                remaining_targets.append(target)
+
+        if remaining_file:
+            try:
+                remaining_path = Path(remaining_file)
+                remaining_path.write_text("\n".join(remaining_targets) + "\n", encoding="utf-8")
+                click.echo(f"📝 Remaining targets written to {remaining_file}")
+            except Exception as e:
+                click.echo(f"❌ Failed to write remaining targets file: {e}")
+                delete_success = False
+
+        click.echo(f"\n🔢 Summary: {deleted_count} compartments deleted, {failed_count} failures.")
         if delete_success:
             click.echo("✅ Compartment deletion initiated successfully.")
         else:

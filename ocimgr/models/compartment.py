@@ -11,6 +11,7 @@ import oci
 from oci.exceptions import ServiceError
 
 from ..core import AsyncResourceMixin, AsyncOCISession, get_registered_resource_types
+from ..utils import run_with_backoff
 
 
 class CompartmentManager:
@@ -42,14 +43,15 @@ class CompartmentManager:
                 )
                 parent_compartment_id = user_response.data.compartment_id
             
-            # List compartments
+            # List compartments (paginated)
             list_response = await AsyncResourceMixin._run_oci_operation(
+                oci.pagination.list_call_get_all_results,
                 identity_client.list_compartments,
                 compartment_id=parent_compartment_id,
                 access_level="ANY",
                 compartment_id_in_subtree=True
             )
-            
+
             for compartment in list_response.data:
                 if compartment.lifecycle_state == 'ACTIVE':
                     compartments.append({
@@ -215,13 +217,16 @@ class CompartmentManager:
     async def delete_compartment(
         self,
         compartment_id: str,
-        region: Optional[str] = None
+        region: Optional[str] = None,
+        timeout_seconds: int = 600
     ) -> bool:
         """
-        Delete a compartment (must be empty first).
+        Delete a compartment (must be empty first) with timeout.
 
         Args:
             compartment_id: Compartment ID to delete
+            region: Region for deletion (defaults to home region)
+            timeout_seconds: Max time to wait for deletion (default 600s to allow slow operations)
 
         Returns:
             True if deletion initiated, False otherwise
@@ -229,10 +234,40 @@ class CompartmentManager:
         try:
             identity_client = await self.session.get_client('identity', region)
 
-            await AsyncResourceMixin._run_oci_operation(
-                identity_client.delete_compartment,
-                compartment_id=compartment_id
+            details_response = await AsyncResourceMixin._run_oci_operation(
+                identity_client.get_compartment,
+                compartment_id
             )
+            lifecycle_state = details_response.data.lifecycle_state
+            if lifecycle_state != 'ACTIVE':
+                logging.warning(
+                    f"Skipping delete for compartment {compartment_id} in state {lifecycle_state}"
+                )
+                return False
+
+            async def delete_operation():
+                return await AsyncResourceMixin._run_oci_operation(
+                    identity_client.delete_compartment,
+                    compartment_id=compartment_id
+                )
+
+            # Wrap with timeout to fail fast instead of hanging 7+ minutes
+            try:
+                await asyncio.wait_for(
+                    run_with_backoff(
+                        delete_operation,
+                        max_retries=12,
+                        base_delay=5.0,
+                        max_delay=300.0,
+                        jitter=0.3
+                    ),
+                    timeout=timeout_seconds
+                )
+            except asyncio.TimeoutError:
+                logging.warning(
+                    f"⏱️  Timeout deleting compartment {compartment_id} after {timeout_seconds}s (OCI API unresponsive)"
+                )
+                return False
 
             logging.info(f"Deletion initiated for compartment {compartment_id}")
             return True
@@ -241,9 +276,31 @@ class CompartmentManager:
             if e.status == 404:
                 logging.warning(f"Compartment {compartment_id} not found")
                 return False
+            if e.status == 429 or e.status >= 500:
+                # Treat throttling and server errors as transient
+                raise
             logging.error(f"Error deleting compartment {compartment_id}: {e}")
             return False
         except Exception as e:
+            # For transient network issues or throttling the inner backoff
+            # may have retried already, but if we still got an exception let
+            # the caller retry as well by re-raising.  This helps when OCI is
+            # flaking or the connection is closed mid-request.
+            try:
+                from ..utils import is_transient_network_error, is_throttle_error
+            except ImportError:
+                is_transient_network_error = lambda _: False
+                is_throttle_error = lambda _: False
+
+            # Fallback check for protocol errors
+            if 'ProtocolError' in str(e):
+                logging.info(f"Raising protocol error for retry: {e}")
+                raise
+
+            if is_transient_network_error(e) or is_throttle_error(e):
+                logging.info(f"Raising transient error for retry: {e}")
+                raise
+
             logging.error(f"Unexpected error deleting compartment {compartment_id}: {e}")
             return False
     

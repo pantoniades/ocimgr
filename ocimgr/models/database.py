@@ -12,9 +12,10 @@ import oci
 from oci.exceptions import ServiceError
 
 from ..core import (
-    AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder, 
+    AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder,
     register_resource_type, AsyncOCISession, OperationResult, ResourceStatus
 )
+from ..utils import run_with_backoff
 
 
 @register_resource_type
@@ -25,8 +26,14 @@ class AutonomousDatabase(AbstractOCIResource, AsyncResourceMixin):
     deletion_order = DeletionOrder.DATABASES
     
     @classmethod
-    async def discover(cls, session: AsyncOCISession, compartment_id: str) -> List['AutonomousDatabase']:
-        """Discover all autonomous databases across all regions concurrently"""
+    async def discover(cls, session: AsyncOCISession, compartment_id: str, skip_unauthorized: bool = False) -> List['AutonomousDatabase']:
+        """Discover all autonomous databases across all regions concurrently
+
+        Args:
+            session: asynchronous OCI session
+            compartment_id: compartment OCID
+            skip_unauthorized: if True, ignore 401 NotAuthenticated errors silently
+        """
         
         async def discover_in_region(region: str) -> List['AutonomousDatabase']:
             """Discover ADBs in a specific region"""
@@ -36,10 +43,13 @@ class AutonomousDatabase(AbstractOCIResource, AsyncResourceMixin):
                 database_client = await session.get_client('database', region)
                 
                 # Run list operation in thread pool
-                list_adb_response = await cls._run_oci_operation(
-                    database_client.list_autonomous_databases,
-                    compartment_id=compartment_id
-                )
+                async def list_operation():
+                    return await cls._run_oci_operation(
+                        database_client.list_autonomous_databases,
+                        compartment_id=compartment_id
+                    )
+
+                list_adb_response = await run_with_backoff(list_operation)
                 
                 # Iterate through the response data                
                 for adb in list_adb_response.data:
@@ -90,6 +100,9 @@ class AutonomousDatabase(AbstractOCIResource, AsyncResourceMixin):
                     databases.append(cls(resource_info))
                     
             except ServiceError as e:
+                if skip_unauthorized and getattr(e, 'status', None) == 401:
+                    # quietly skip unauthorized regions
+                    return []
                 logging.error(f"Error discovering autonomous databases in {region}: {e}")
             except Exception as e:
                 logging.error(f"Unexpected error discovering autonomous databases in {region}: {e}")
@@ -133,8 +146,17 @@ class AutonomousDatabase(AbstractOCIResource, AsyncResourceMixin):
             
             logging.info(f"Disabling delete protection for database {self.info.name}")
             
+            # OCI SDK update expects deletion_policy, not is_delete_protected
+            # the SDK expects a UpdateDeletionPolicyDetails object
+            # Build policy object with best effort; some SDK versions expect
+            # `policy` string, others use `is_delete_protected` boolean.
+            try:
+                policy_obj = oci.database.models.UpdateDeletionPolicyDetails(policy="DELETE")
+            except TypeError:
+                policy_obj = oci.database.models.UpdateDeletionPolicyDetails(is_delete_protected=False)
+
             update_details = oci.database.models.UpdateAutonomousDatabaseDetails(
-                is_delete_protected=False
+                deletion_policy=policy_obj
             )
             
             await self._run_oci_operation(
@@ -313,8 +335,14 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
     deletion_order = DeletionOrder.DATABASES
     
     @classmethod
-    async def discover(cls, session: AsyncOCISession, compartment_id: str) -> List['MySQLDBSystem']:
-        """Discover all MySQL DB systems across all regions concurrently"""
+    async def discover(cls, session: AsyncOCISession, compartment_id: str, skip_unauthorized: bool = False) -> List['MySQLDBSystem']:
+        """Discover all MySQL DB systems across all regions concurrently
+
+        Args:
+            session: asynchronous OCI session
+            compartment_id: compartment OCID
+            skip_unauthorized: if True, ignore 401 NotAuthenticated errors silently
+        """
         
         async def discover_in_region(region: str) -> List['MySQLDBSystem']:
             """Discover MySQL systems in a specific region"""
@@ -325,10 +353,13 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                 mysql_client = await session.get_client('mysql', region)
                 
                 # The correct method name in OCI SDK
-                list_response = await cls._run_oci_operation(
-                    mysql_client.list_db_systems,  # This should be correct
-                    compartment_id=compartment_id
-                )
+                async def list_operation():
+                    return await cls._run_oci_operation(
+                        mysql_client.list_db_systems,  # This should be correct
+                        compartment_id=compartment_id
+                    )
+
+                list_response = await run_with_backoff(list_operation)
                 
                 
                 for db_system in list_response.data:
@@ -336,8 +367,13 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     if db_system.lifecycle_state in ['DELETED', 'DELETING']:
                         continue
                     
-                    # Get delete protection status
+                    # Get delete protection status (MySQL uses deletion_policy)
+                    deletion_policy = getattr(db_system, 'deletion_policy', None)
                     has_delete_protection = getattr(db_system, 'is_delete_protected', False)
+                    if deletion_policy is not None:
+                        policy_value = getattr(deletion_policy, 'value', deletion_policy)
+                        policy_text = str(policy_value).upper()
+                        has_delete_protection = policy_text != 'DELETE'
                     
                     # Estimate deletion time based on system configuration using proper match
                     shape_name = getattr(db_system, 'shape_name', '')
@@ -391,6 +427,8 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     db_systems.append(cls(resource_info))
                     
             except ServiceError as e:
+                if skip_unauthorized and getattr(e, 'status', None) == 401:
+                    return []
                 logging.error(f"Error discovering MySQL DB systems in {region}: {e}")
             except Exception as e:
                 logging.error(f"Unexpected error discovering MySQL DB systems in {region}: {e}")
@@ -434,8 +472,18 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
             
             logging.info(f"Disabling delete protection for MySQL system {self.info.name}")
             
+            # For MySQL DB systems the UpdateDeletionPolicyDetails uses
+            # `is_delete_protected` (bool) rather than a `policy` string.
+            # Set `is_delete_protected=False` to allow deletion.
+            # Some mysql SDK versions use `policy` instead of
+            # `is_delete_protected` on UpdateDeletionPolicyDetails.
+            try:
+                policy_obj = oci.mysql.models.UpdateDeletionPolicyDetails(is_delete_protected=False)
+            except TypeError:
+                policy_obj = oci.mysql.models.UpdateDeletionPolicyDetails(policy="DELETE")
+
             update_details = oci.mysql.models.UpdateDbSystemDetails(
-                is_delete_protected=False
+                deletion_policy=policy_obj
             )
             
             await self._run_oci_operation(
@@ -538,10 +586,35 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
             # Check system state before deletion
             match self.info.lifecycle_state:
                 case 'ACTIVE':
-                    # Ready to delete
-                    pass
+                    # Stop the DB system first before deletion
+                    logging.info(f"Stopping MySQL DB system {self.info.name} before deletion")
+                    
+                    stop_details = {'shutdown_type': 'FAST'}
+                    await self._run_oci_operation(
+                        mysql_client.stop_db_system,
+                        self.info.ocid,
+                        stop_details
+                    )
+                    
+                    # Wait for system to stop
+                    stop_success = await self._wait_for_state(
+                        lambda: mysql_client.get_db_system(self.info.ocid),
+                        ['INACTIVE'],
+                        max_wait=600  # 10 minutes
+                    )
+                    
+                    if not stop_success:
+                        error_msg = "Timeout waiting for DB system to stop before deletion"
+                        return OperationResult(
+                            resource_ocid=self.info.ocid,
+                            operation="delete",
+                            status=ResourceStatus.FAILED,
+                            message=error_msg,
+                            duration=time.time() - start_time
+                        )
+                    
                 case 'INACTIVE':
-                    # System is stopped, can delete
+                    # System is already stopped, can delete
                     pass
                 case 'CREATING' | 'UPDATING' | 'DELETING' | 'DELETED':
                     error_msg = f"Cannot delete MySQL system in state: {self.info.lifecycle_state}"
