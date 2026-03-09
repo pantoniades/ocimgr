@@ -150,7 +150,8 @@ class OCIMgrAsyncCLI:
     
     async def initialize(self) -> None:
         """Initialize async components"""
-        await setup_async_logging(level=self.log_level)
+        log_file = await setup_async_logging(level=self.log_level)
+        click.echo(f"📝 Logging to {log_file}")
         
         try:
             config = OCIConfig(self.config_path, self.profile)
@@ -195,7 +196,7 @@ class OCIMgrAsyncCLI:
         self, 
         compartment_ids: List[str],
         resource_type_filter: Optional[List[str]] = None,
-        skip_unauthorized: bool = False
+        skip_unauthorized: bool = True
     ) -> Dict[str, List[AbstractOCIResource]]:
         """
         Discover resources with concurrent multi-region scanning.
@@ -303,7 +304,9 @@ class OCIMgrAsyncCLI:
         compartment_ids: List[str],
         resource_type_filter: Optional[List[str]] = None,
         max_concurrent: int = 1,
-        verbose: bool = False
+        verbose: bool = False,
+        skip_unauthorized: bool = True,
+        request_timeout: float = 60.0
     ) -> Dict[str, Dict[str, Dict[str, Any]]]:
         """
         Fast, counts-only discovery using list calls (no per-resource detail).
@@ -335,25 +338,56 @@ class OCIMgrAsyncCLI:
             async def operation():
                 client = await self.session.get_client(service, region)
                 method = getattr(client, method_name)
-                response = await AsyncResourceMixin._run_oci_operation(
-                    oci.pagination.list_call_get_all_results,
-                    method,
-                    compartment_id=compartment_id
+                response = await asyncio.wait_for(
+                    AsyncResourceMixin._run_oci_operation(
+                        oci.pagination.list_call_get_all_results,
+                        method,
+                        compartment_id=compartment_id
+                    ),
+                    timeout=request_timeout
                 )
                 return region, len(response.data)
 
             async with semaphore:
-                return await run_with_backoff(operation)
+                try:
+                    return await run_with_backoff(operation)
+                except asyncio.TimeoutError:
+                    logging.warning(
+                        "Fast count timed out for %s in %s (%s)",
+                        resource_type,
+                        compartment_id,
+                        region
+                    )
+                    return region, 0
+                except oci.exceptions.ServiceError as e:
+                    if e.status in {401, 403}:
+                        self.session.mark_region_unauthorized(region)
+                        if skip_unauthorized:
+                            if verbose:
+                                logging.warning(f"Skipping unauthorized region {region} for {resource_type}: {e}")
+                            return region, 0
+                    raise
 
         for compartment_id in compartment_ids:
             counts: Dict[str, int] = {}
 
             for resource_type, (service, method_name) in resource_map.items():
+                regions = (
+                    self.session.get_authorized_regions()
+                    if skip_unauthorized
+                    else self.session.get_all_regions()
+                )
                 tasks = [
                     list_count(compartment_id, resource_type, service, method_name, region)
-                    for region in self.session.get_all_regions()
+                    for region in regions
                 ]
 
+                logging.info(
+                    "Fast counts for %s in compartment %s across %d regions",
+                    resource_type,
+                    compartment_id,
+                    len(regions)
+                )
                 results_per_region = await asyncio.gather(*tasks, return_exceptions=True)
                 total_count = 0
                 regions_with_resources: List[str] = []
@@ -375,6 +409,12 @@ class OCIMgrAsyncCLI:
                     "count": total_count,
                     "regions": sorted(set(regions_with_resources))
                 }
+                logging.info(
+                    "Fast count result for %s in compartment %s: %d",
+                    resource_type,
+                    compartment_id,
+                    total_count
+                )
 
             results[compartment_id] = counts
 
@@ -689,7 +729,20 @@ class OCIMgrAsyncCLI:
 def async_command(f):
     """Decorator to make Click commands async-aware"""
     def wrapper(*args, **kwargs):
-        return asyncio.run(f(*args, **kwargs))
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(f(*args, **kwargs))
+        try:
+            return loop.run_until_complete(task)
+        except KeyboardInterrupt:
+            for pending in asyncio.all_tasks(loop):
+                pending.cancel()
+            loop.run_until_complete(
+                asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True)
+            )
+            raise
+        finally:
+            loop.close()
     return wrapper
 
 
@@ -1075,7 +1128,8 @@ async def _handle_validate_compartment(cli_app: OCIMgrAsyncCLI) -> None:
               default='table', help='Output format')
 @click.option('--output', '-o', help='Output file (stdout if not specified)')
 @click.option('--resource-types', help='Comma-separated list of resource types to filter')
-@click.option('--skip-unauthorized', is_flag=True, help='Skip 401 unauthorized regions')
+@click.option('--skip-unauthorized/--no-skip-unauthorized', default=True,
+              help='Skip 401/403 unauthorized regions (default: on)')
 @click.pass_context
 @async_command
 async def list_resources(ctx, compartment_id, format, output, resource_types, skip_unauthorized):
@@ -1148,7 +1202,8 @@ async def list_resources(ctx, compartment_id, format, output, resource_types, sk
 @click.option('--dry-run', is_flag=True, help='Perform dry run only')
 @click.option('--yes', is_flag=True, help='Skip confirmation prompts')
 @click.option('--resource-types', help='Comma-separated list of resource types to filter')
-@click.option('--skip-unauthorized', is_flag=True, help='Skip 401 unauthorized regions')
+@click.option('--skip-unauthorized/--no-skip-unauthorized', default=True,
+              help='Skip 401/403 unauthorized regions (default: on)')
 @click.pass_context
 @async_command
 async def delete_all(ctx, compartment_id, dry_run, yes, resource_types, skip_unauthorized):
@@ -1294,7 +1349,8 @@ async def compartments_command(ctx, format, output, verbose):
               default='table', help='Output format')
 @click.option('--output', '-o', help='Save output to file')
 @click.option('--types', '-t', help='Resource types: compute_instance,autonomous_database,mysql_db_system,oke_cluster')
-@click.option('--skip-unauthorized', is_flag=True, help='Skip 401 unauthorized regions')
+@click.option('--skip-unauthorized/--no-skip-unauthorized', default=True,
+              help='Skip 401/403 unauthorized regions (default: on)')
 @click.option('--verbose', '-v', is_flag=True, help='Show detailed progress')
 @click.pass_context
 @async_command
@@ -1516,7 +1572,8 @@ async def resources_command(ctx, compartment_numbers, format, output, types, ski
 @click.option('--compartment-concurrency', type=int, default=1, help='Max concurrent compartments to scan')
 @click.option('--list-empty', is_flag=True, help='Include rows with zero counts')
 @click.option('--discover-regions', is_flag=True, help='Rebuild cached regions from OCI')
-@click.option('--skip-unauthorized', is_flag=True, help='Skip 401 unauthorized regions')
+@click.option('--skip-unauthorized/--no-skip-unauthorized', default=True,
+              help='Skip 401/403 unauthorized regions (default: on)')
 @click.option('--verbose', '-v', is_flag=True, help='Verbose output')
 @click.pass_context
 @async_command
@@ -1547,12 +1604,15 @@ async def inventory_command(
     try:
         await cli_app.initialize()
 
+        logging.info("Starting inventory command")
+
         click.echo("🌍 Resolving regions (cache/subscriptions)...")
         cache_path = get_region_cache_path(ctx.obj.get('config'))
         cached_regions = None if discover_regions else load_region_cache(cache_path)
 
         if cached_regions:
             click.echo(f"🗃️  Using cached regions from {cache_path}")
+            logging.info("Using cached regions from %s", cache_path)
             await refresh_session_regions(cli_app, cached_regions, verbose, "cached")
         else:
             if discover_regions:
@@ -1560,19 +1620,24 @@ async def inventory_command(
             else:
                 click.echo("🗃️  Region cache missing; rebuilding...")
             click.echo("🔍 Discovering subscribed regions (may take a moment)...")
+            logging.info("Discovering subscribed regions")
             subscribed_regions = await discover_and_cache_regions(cli_app, cache_path, verbose)
             if subscribed_regions:
                 click.echo(f"✅ Discovered {len(subscribed_regions)} subscribed regions")
+                logging.info("Discovered %d subscribed regions", len(subscribed_regions))
                 await refresh_session_regions(cli_app, subscribed_regions, verbose, "subscribed")
             elif verbose:
                 click.echo("⚠️ No subscribed regions returned; using config default")
 
         click.echo("📋 Loading compartment list...")
+        logging.info("Loading compartment list")
 
         all_compartments = await cli_app.list_compartments()
         if not all_compartments:
             click.echo("📭 No compartments found.")
             return
+
+        logging.info("Loaded %d compartments", len(all_compartments))
 
         # Resolve compartment scope
         scoped_compartments = all_compartments
@@ -1607,6 +1672,7 @@ async def inventory_command(
 
             if verbose:
                 click.echo(f"🎯 Scoped to compartment subtree: {target['name']}")
+            logging.info("Scoped inventory to subtree: %s", target['name'])
 
         resource_type_filter = None
         if types:
@@ -1649,12 +1715,19 @@ async def inventory_command(
                 list_path.parent.mkdir(parents=True, exist_ok=True)
                 list_path.write_text("\n".join(list_lines).rstrip() + "\n", encoding="utf-8")
                 click.echo(f"📝 Compartment list written to {list_path}")
+                logging.info("Wrote compartment list to %s", list_path)
             except Exception as exc:
                 click.echo(f"❌ Failed to write compartment list to {list_path}: {exc}")
+                logging.error("Failed to write compartment list to %s: %s", list_path, exc)
 
         click.echo(
             f"🔍 Scanning {len(compartment_ids)} compartments across "
             f"{len(cli_app.session.get_all_regions())} regions..."
+        )
+        logging.info(
+            "Scanning %d compartments across %d regions",
+            len(compartment_ids),
+            len(cli_app.session.get_all_regions())
         )
 
         counts_by_compartment: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -1672,16 +1745,29 @@ async def inventory_command(
                     click.echo(
                         f"➡️  [{progress_index}/{total_compartments}] Scanning compartment {name}"
                     )
+                    logging.info(
+                        "Inventory scan %d/%d for compartment %s",
+                        progress_index,
+                        total_compartments,
+                        name
+                    )
 
                 return await cli_app.discover_fast_counts(
                     [compartment_id],
                     resource_type_filter=resource_type_filter,
                     max_concurrent=max_concurrent,
-                    verbose=verbose
+                    verbose=verbose,
+                    skip_unauthorized=skip_unauthorized
                 )
 
-        tasks = [scan_compartment(compartment_id) for compartment_id in compartment_ids]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        tasks = [asyncio.create_task(scan_compartment(compartment_id)) for compartment_id in compartment_ids]
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
 
         for result in results:
             if isinstance(result, dict):
@@ -1732,6 +1818,9 @@ async def inventory_command(
             click.echo("\n📊 Totals by resource type:")
             for resource_type, count in sorted(totals_by_type.items()):
                 click.echo(f"  • {resource_type}: {count}")
+                logging.info("Inventory total %s: %d", resource_type, count)
+
+        logging.info("Inventory command completed")
 
     finally:
         await cli_app.cleanup()
@@ -1743,6 +1832,8 @@ async def inventory_command(
               help='Path to a file containing one compartment name/OCID per line')
 @click.option('--remaining-file', type=click.Path(dir_okay=False),
               help='Write remaining (not deleted) targets to this file')
+@click.option('--skip-protected', is_flag=True,
+              help='Skip targets containing delete-protected databases (report them for manual cleanup)')
 @click.option('--dry-run', is_flag=True, help='Show deletion plan only (no changes)')
 @click.option('--yes', is_flag=True, help='Skip confirmation prompts')
 @click.option('--max-concurrent', type=int, default=3, help='Max concurrent API calls per compartment')
@@ -1752,7 +1843,8 @@ async def inventory_command(
 @click.option('--compartment-delay', type=float, default=0.0, help='Delay (seconds) between compartment deletes')
 @click.option('--target-delay', type=float, default=0.0, help='Delay (seconds) between target compartments')
 @click.option('--discover-regions', is_flag=True, help='Rebuild cached regions from OCI')
-@click.option('--skip-unauthorized', is_flag=True, help='Skip 401 unauthorized regions')
+@click.option('--skip-unauthorized/--no-skip-unauthorized', default=True,
+              help='Skip 401/403 unauthorized regions (default: on)')
 @click.option('--verbose', '-v', is_flag=True, help='Verbose output')
 @click.pass_context
 @async_command
@@ -1761,6 +1853,7 @@ async def delete_compartment_command(
     targets,
     targets_file,
     remaining_file,
+    skip_protected,
     dry_run,
     yes,
     max_concurrent,
@@ -1804,6 +1897,7 @@ async def delete_compartment_command(
         if not combined_targets:
             click.echo("❌ No compartment targets provided.")
             click.echo("💡 Provide targets as arguments or with --targets-file")
+            logging.warning("delete-compartment invoked with no targets")
             return
 
         click.echo("🌍 Resolving regions (cache/subscriptions)...")
@@ -1829,6 +1923,7 @@ async def delete_compartment_command(
         all_compartments = await cli_app.list_compartments()
         if not all_compartments:
             click.echo("📭 No compartments found.")
+            logging.warning("No compartments returned during delete-compartment")
             return
 
         # validate all provided targets (OCIDs or names)
@@ -1879,6 +1974,7 @@ async def delete_compartment_command(
         # always ask once before proceeding regardless of --yes; --yes only skips later prompts
         if not click.confirm(f"Continue with deletion of {len(found)} found compartments?", default=False):
             click.echo("❌ Operation cancelled.")
+            logging.info("User cancelled delete-compartment confirmation prompt")
             return
 
         parent_map = {comp['id']: comp.get('parent_id') for comp in all_compartments}
@@ -1909,13 +2005,31 @@ async def delete_compartment_command(
         delete_region = home_region or cli_app.session.get_current_region()
         if verbose:
             click.echo(f"🏠 Using home region for compartment deletes: {delete_region}")
+        logging.info(f"Compartment deletion region: {delete_region}")
 
         delete_success = True
         deleted_count = 0
         failed_count = 0
+        resource_deleted_total = 0
+        resource_failed_total = 0
+        resource_target_total = 0
+        was_cancelled = False
+        skipped_protected: Dict[str, Dict[str, Any]] = {}
+
+        def print_running_totals(label: str = "Running") -> None:
+            click.echo(
+                f"📊 {label} totals: resources deleted {resource_deleted_total}, "
+                f"failed {resource_failed_total} (targets {resource_target_total}); "
+                f"compartments deleted {deleted_count}, failed {failed_count}"
+            )
 
         remaining_targets = []
-        for target in combined_targets:
+        randomized_targets = combined_targets.copy()
+        random.shuffle(randomized_targets)
+        if verbose:
+            click.echo("🔀 Randomized target processing order to reduce repeated blocking patterns.")
+
+        for target in randomized_targets:
             target_compartment = None
             if target.startswith("ocid1.compartment"):
                 target_compartment = next(
@@ -1937,6 +2051,7 @@ async def delete_compartment_command(
 
             if not target_compartment:
                 click.echo(f"❌ Compartment '{target}' not found.")
+                logging.warning(f"Target compartment not found: {target}")
                 delete_success = False
                 remaining_targets.append(target)
                 continue
@@ -2021,17 +2136,60 @@ async def delete_compartment_command(
             for resources in resources_by_compartment.values():
                 all_resources.extend(resources)
 
+            protected_resources = [r for r in all_resources if r.info.has_delete_protection]
+            if skip_protected and protected_resources:
+                skipped_protected[target_compartment['id']] = {
+                    'target': target,
+                    'qualified_path': get_qualified_path(target_compartment['id']),
+                    'resources': [
+                        {
+                            'resource_type': r.info.resource_type,
+                            'name': r.info.name,
+                            'region': r.info.region,
+                            'ocid': r.info.ocid,
+                            'compartment_id': r.info.compartment_id
+                        }
+                        for r in protected_resources
+                    ]
+                }
+                click.echo(
+                    f"⚠️  Skipping {target_compartment['name']} due to delete-protected resources "
+                    f"({len(protected_resources)})."
+                )
+                remaining_targets.append(target)
+                delete_success = False
+                continue
+
             if not all_resources:
                 click.echo("📭 No resources found in selected compartments.")
                 click.echo("🗑️ Directly deleting empty compartments (no resource cleanup needed)...")
+                logging.info(f"No resources found in subtree for {target_compartment['id']}")
                 target_deleted = True
-                random.shuffle(scoped_compartments)
+                failed_compartments: set[str] = set()
+
+                def has_failed_descendant(comp_id: str) -> bool:
+                    return any(
+                        failed_id != comp_id and is_descendant(failed_id, comp_id)
+                        for failed_id in failed_compartments
+                    )
+
                 for index, comp in enumerate(scoped_compartments, start=1):
                     click.echo(
                         f"🔁 Deleting compartment {index} of {len(scoped_compartments)}: {comp.get('name','<unknown>')}"
                     )
                     # For empty compartments, skip resource deletion entirely
                     if comp['id'] == target_compartment['id'] or comp.get('parent_id'):
+                        if has_failed_descendant(comp['id']):
+                            target_deleted = False
+                            failed_count += 1
+                            failed_compartments.add(comp['id'])
+                            delete_success = False
+                            click.echo(
+                                f"⚠️  Skipping {comp['name']} because a child compartment failed to delete."
+                            )
+                            print_running_totals("Skipped")
+                            continue
+
                         async def delete_operation() -> bool:
                             return await cli_app.compartment_manager.delete_compartment(
                                 comp['id'],
@@ -2071,8 +2229,13 @@ async def delete_compartment_command(
                             delete_success = False
                             target_deleted = False
                             failed_count += 1
+                            failed_compartments.add(comp['id'])
                             click.echo(f"❌ Failed to delete compartment {comp['name']}")
-                            logging.warning(f"❌ Failed to delete compartment: {comp.get('name')} ({comp['id']})")
+                            logging.warning(
+                                f"❌ Failed to delete compartment: {comp.get('name')} ({comp['id']})"
+                            )
+
+                        print_running_totals()
 
                         if compartment_delay > 0 and index < len(scoped_compartments):
                             await asyncio.sleep(compartment_delay)
@@ -2112,11 +2275,16 @@ async def delete_compartment_command(
                         f"{len(scoped_compartments)} compartments?"
                     ):
                         click.echo("❌ Operation cancelled.")
+                        logging.info("User cancelled resource deletion confirmation")
                         delete_success = False
                         continue
 
                 if not dry_run:
-                    await cli_app.execute_deletion(deletion_plan, dry_run=False)
+                    deletion_summary = await cli_app.execute_deletion(deletion_plan, dry_run=False)
+                    resource_target_total += deletion_summary.get("total", 0)
+                    resource_deleted_total += deletion_summary.get("successful", 0)
+                    resource_failed_total += deletion_summary.get("failed", 0)
+                    print_running_totals()
 
             if dry_run:
                 click.echo("🧪 Dry run complete. No resources were deleted.")
@@ -2131,20 +2299,38 @@ async def delete_compartment_command(
                     default=False
                 ):
                     click.echo("❌ Compartment deletion cancelled.")
+                    logging.info("User cancelled compartment deletion prompt")
                     delete_success = False
                     remaining_targets.append(target)
                     continue
 
-            click.echo("🗑️ Deleting compartments (leaf to root, random order)...")
+            click.echo("🗑️ Deleting compartments (leaf to root, dependency aware)...")
             target_deleted = True
-            # randomize order to avoid hitting same regional issues repeatedly
-            random.shuffle(scoped_compartments)
+            failed_compartments: set[str] = set()
+
+            def has_failed_descendant(comp_id: str) -> bool:
+                return any(
+                    failed_id != comp_id and is_descendant(failed_id, comp_id)
+                    for failed_id in failed_compartments
+                )
+
             for index, comp in enumerate(scoped_compartments, start=1):
                 # progress indicator
                 click.echo(
                     f"🔁 Deleting compartment {index} of {len(scoped_compartments)}: {comp.get('name','<unknown>')}"
                 )
                 if comp['id'] == target_compartment['id'] or comp.get('parent_id'):
+                    if has_failed_descendant(comp['id']):
+                        target_deleted = False
+                        failed_count += 1
+                        failed_compartments.add(comp['id'])
+                        delete_success = False
+                        click.echo(
+                            f"⚠️  Skipping {comp['name']} because a child compartment failed to delete."
+                        )
+                        print_running_totals("Skipped")
+                        continue
+
                     async def delete_operation() -> bool:
                         return await cli_app.compartment_manager.delete_compartment(
                             comp['id'],
@@ -2169,7 +2355,13 @@ async def delete_compartment_command(
                         delete_success = False
                         target_deleted = False
                         failed_count += 1
+                        failed_compartments.add(comp['id'])
                         click.echo(f"❌ Failed to delete compartment {comp['name']}")
+                        logging.warning(
+                            f"Failed to delete compartment {comp.get('name')} ({comp['id']})"
+                        )
+
+                    print_running_totals()
 
                     if compartment_delay > 0 and index < len(scoped_compartments):
                         await asyncio.sleep(compartment_delay)
@@ -2187,15 +2379,43 @@ async def delete_compartment_command(
                 click.echo(f"📝 Remaining targets written to {remaining_file}")
             except Exception as e:
                 click.echo(f"❌ Failed to write remaining targets file: {e}")
+                logging.error(f"Failed to write remaining targets file {remaining_file}: {e}")
                 delete_success = False
 
-        click.echo(f"\n🔢 Summary: {deleted_count} compartments deleted, {failed_count} failures.")
+        if skipped_protected:
+            click.echo("\n🔒 Targets skipped due to delete-protected databases:")
+            for payload in skipped_protected.values():
+                click.echo(f"  • {payload['qualified_path']}")
+                for resource in payload['resources']:
+                    click.echo(
+                        "    - {resource_type}: {name} ({region}) {ocid}".format(**resource)
+                    )
+
+        click.echo(
+            f"\n🔢 Summary: {deleted_count} compartments deleted, {failed_count} failures. "
+            f"Resources deleted: {resource_deleted_total}, failed: {resource_failed_total} "
+            f"(targets: {resource_target_total})."
+        )
         if delete_success:
             click.echo("✅ Compartment deletion initiated successfully.")
         else:
             click.echo("⚠️ Some compartments failed to delete. Check logs for details.")
 
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        was_cancelled = True
+        click.echo("\n⚠️ Operation cancelled by user.")
+        click.echo(
+            f"🔢 Final totals (cancelled): compartments deleted {deleted_count}, "
+            f"failed {failed_count}; resources deleted {resource_deleted_total}, "
+            f"failed {resource_failed_total} (targets {resource_target_total})."
+        )
     finally:
+        if not was_cancelled:
+            click.echo(
+                f"🔢 Final totals: compartments deleted {deleted_count}, failed {failed_count}; "
+                f"resources deleted {resource_deleted_total}, failed {resource_failed_total} "
+                f"(targets {resource_target_total})."
+            )
         await cli_app.cleanup()
 
 

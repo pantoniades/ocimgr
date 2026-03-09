@@ -100,19 +100,28 @@ class AutonomousDatabase(AbstractOCIResource, AsyncResourceMixin):
                     databases.append(cls(resource_info))
                     
             except ServiceError as e:
-                if skip_unauthorized and getattr(e, 'status', None) == 401:
-                    # quietly skip unauthorized regions
-                    return []
+                if getattr(e, 'status', None) in {401, 403}:
+                    session.mark_region_unauthorized(region)
+                    if skip_unauthorized:
+                        # quietly skip unauthorized regions
+                        return []
                 logging.error(f"Error discovering autonomous databases in {region}: {e}")
             except Exception as e:
                 logging.error(f"Unexpected error discovering autonomous databases in {region}: {e}")
         
             return databases
         
-        # Discover across all regions concurrently
+        # Discover across all regions concurrently (with concurrency limit)
+        max_concurrent = getattr(session, "max_concurrent_regions", 5)
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def guarded_discover(region: str) -> List['AutonomousDatabase']:
+            async with semaphore:
+                return await discover_in_region(region)
+
         region_tasks = [
-            discover_in_region(region) 
-            for region in session.get_all_regions()
+            guarded_discover(region)
+            for region in session.get_authorized_regions()
         ]
         
         region_results = await asyncio.gather(*region_tasks, return_exceptions=True)
@@ -427,18 +436,27 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     db_systems.append(cls(resource_info))
                     
             except ServiceError as e:
-                if skip_unauthorized and getattr(e, 'status', None) == 401:
-                    return []
+                if getattr(e, 'status', None) in {401, 403}:
+                    session.mark_region_unauthorized(region)
+                    if skip_unauthorized:
+                        return []
                 logging.error(f"Error discovering MySQL DB systems in {region}: {e}")
             except Exception as e:
                 logging.error(f"Unexpected error discovering MySQL DB systems in {region}: {e}")
         
             return db_systems
         
-        # Discover across all regions concurrently
+        # Discover across all regions concurrently (with concurrency limit)
+        max_concurrent = getattr(session, "max_concurrent_regions", 5)
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def guarded_discover(region: str) -> List['MySQLDBSystem']:
+            async with semaphore:
+                return await discover_in_region(region)
+
         region_tasks = [
-            discover_in_region(region) 
-            for region in session.get_all_regions()
+            guarded_discover(region)
+            for region in session.get_authorized_regions()
         ]
         
         region_results = await asyncio.gather(*region_tasks, return_exceptions=True)
@@ -492,11 +510,10 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                 update_db_system_details=update_details
             )
             
-            # Wait for update to complete
-            update_success = await self._wait_for_state(
-                lambda: mysql_client.get_db_system(self.info.ocid),
-                ['ACTIVE'],
-                max_wait=300  # 5 minutes
+            # Wait for delete protection to clear (lifecycle state may remain ACTIVE)
+            update_success = await self._wait_for_delete_protection_disabled(
+                mysql_client,
+                max_wait=1800  # 30 minutes (delete protection updates can be slow)
             )
             
             if not update_success:
@@ -566,7 +583,7 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     heat_wave_deleted = await self._wait_for_state(
                         lambda: mysql_client.get_heat_wave_cluster(self.info.ocid),
                         ['DELETED'],
-                        max_wait=600  # 10 minutes for HeatWave deletion
+                        max_wait=1200  # 20 minutes for HeatWave deletion
                     )
                     
                     if not heat_wave_deleted:
@@ -589,18 +606,20 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     # Stop the DB system first before deletion
                     logging.info(f"Stopping MySQL DB system {self.info.name} before deletion")
                     
-                    stop_details = {'shutdown_type': 'FAST'}
+                    stop_details = oci.mysql.models.StopDbSystemDetails(
+                        shutdown_type="FAST"
+                    )
                     await self._run_oci_operation(
                         mysql_client.stop_db_system,
-                        self.info.ocid,
-                        stop_details
+                        db_system_id=self.info.ocid,
+                        stop_db_system_details=stop_details
                     )
                     
                     # Wait for system to stop
                     stop_success = await self._wait_for_state(
                         lambda: mysql_client.get_db_system(self.info.ocid),
                         ['INACTIVE'],
-                        max_wait=600  # 10 minutes
+                        max_wait=1200  # 20 minutes
                     )
                     
                     if not stop_success:
@@ -630,7 +649,7 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     stable_success = await self._wait_for_state(
                         lambda: mysql_client.get_db_system(self.info.ocid),
                         ['ACTIVE', 'INACTIVE'],
-                        max_wait=600  # 10 minutes
+                        max_wait=1200  # 20 minutes
                     )
                     
                     if not stable_success:
@@ -686,3 +705,40 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                 duration=time.time() - start_time,
                 error_details={'exception': str(e)}
             )
+
+    async def _wait_for_delete_protection_disabled(
+        self,
+        mysql_client,
+        max_wait: int = 1800,
+        poll_interval: int = 15
+    ) -> bool:
+        """Wait for MySQL delete protection to be disabled (policy DELETE)."""
+        start_time = time.time()
+
+        while (time.time() - start_time) < max_wait:
+            try:
+                response = await self._run_oci_operation(
+                    mysql_client.get_db_system,
+                    db_system_id=self.info.ocid
+                )
+                db_system = response.data if hasattr(response, "data") else None
+
+                if db_system:
+                    deletion_policy = getattr(db_system, 'deletion_policy', None)
+                    is_delete_protected = getattr(db_system, 'is_delete_protected', None)
+                    policy_value = getattr(deletion_policy, 'value', deletion_policy)
+                    policy_text = str(policy_value).upper() if deletion_policy is not None else None
+
+                    if policy_text == 'DELETE' or is_delete_protected is False:
+                        return True
+
+                await asyncio.sleep(poll_interval)
+
+            except Exception as e:
+                logging.warning(f"Error checking delete protection state: {e}")
+                await asyncio.sleep(poll_interval)
+
+        logging.warning(
+            f"Timeout waiting for delete protection to clear after {max_wait} seconds"
+        )
+        return False

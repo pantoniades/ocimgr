@@ -26,8 +26,19 @@ class OKECluster(AbstractOCIResource, AsyncResourceMixin):
     deletion_order = DeletionOrder.APPLICATIONS
     
     @classmethod
-    async def discover(cls, session: AsyncOCISession, compartment_id: str) -> List['OKECluster']:
-        """Discover all OKE clusters across all regions concurrently"""
+    async def discover(
+        cls,
+        session: AsyncOCISession,
+        compartment_id: str,
+        skip_unauthorized: bool = False
+    ) -> List['OKECluster']:
+        """Discover all OKE clusters across all regions concurrently.
+
+        Args:
+            session: async OCI session
+            compartment_id: compartment OCID
+            skip_unauthorized: if True, ignore 401/403 regions silently
+        """
         
         async def discover_in_region(region: str) -> List['OKECluster']:
             """Discover OKE clusters in a specific region"""
@@ -112,16 +123,28 @@ class OKECluster(AbstractOCIResource, AsyncResourceMixin):
                     clusters.append(cls(resource_info))
                     
             except ServiceError as e:
+                if e.status in {401, 403}:
+                    session.mark_region_unauthorized(region)
+                    if skip_unauthorized:
+                        logging.debug(f"Skipping unauthorized OKE discovery in {region}: {e}")
+                        return []
                 logging.error(f"Error discovering OKE clusters in {region}: {e}")
             except Exception as e:
                 logging.error(f"Unexpected error discovering OKE clusters in {region}: {e}")
         
             return clusters
         
-        # Discover across all regions concurrently
+        # Discover across all regions concurrently (with concurrency limit)
+        max_concurrent = getattr(session, "max_concurrent_regions", 5)
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def guarded_discover(region: str) -> List['OKECluster']:
+            async with semaphore:
+                return await discover_in_region(region)
+
         region_tasks = [
-            discover_in_region(region) 
-            for region in session.get_all_regions()
+            guarded_discover(region)
+            for region in session.get_authorized_regions()
         ]
         
         region_results = await asyncio.gather(*region_tasks, return_exceptions=True)

@@ -38,6 +38,12 @@ Run unit tests with pytest:
 pytest -q
 ```
 
+Run the inventory fast-count tests only:
+
+```bash
+pytest -q tests/test_inventory_fast_counts.py
+```
+
 Notes
 -----
 - The project relies on OCI config and credentials. See OCI SDK documentation for configuring `~/.oci/config`.
@@ -80,10 +86,24 @@ regions=us-ashburn-1,us-phoenix-1
 ocimgr --output run.log inventory
 ```
 
+By default, OCIMgr writes a unique log file per run (e.g. `ocimgr-20250306-111755.log`).
+Use `--output` to tee console output to a specific file; structured logs still go to
+the auto-generated log file unless you override it in code.
+
+Inventory now logs progress (regions, compartment scans, totals) at INFO level so long
+runs will keep the log file active even when CLI output is quiet.
+
+If inventory appears to stall, each regional list call now has a bounded timeout so
+slow regions return sooner and logging continues.
+
 ### List compartments
 ```bash
 ocimgr compartments
 ```
+
+If you see identity timeouts while listing compartments, ensure your OCI config
+`region` is set to your tenancy’s home region. OCIMgr now uses the configured
+home region for identity calls and retries transient failures automatically.
 
 ### High-level inventory (counts only, hides zero rows)
 ```bash
@@ -98,9 +118,12 @@ inventory will discover subscribed regions and create it.
 ocimgr inventory --discover-regions
 ```
 
-### Skip unauthorized regions (ignore 401s)
+### Skip unauthorized regions (ignore 401/403)
+Unauthorized regions are skipped automatically to reduce throttling. Use
+`--no-skip-unauthorized` if you want strict behavior.
 ```bash
 ocimgr inventory --skip-unauthorized
+ocimgr inventory --no-skip-unauthorized
 ```
 
 ### Inventory scoped to a compartment subtree
@@ -131,6 +154,7 @@ ocimgr delete-compartment "Finance" --dry-run
 ### Delete a compartment while skipping unauthorized regions
 ```bash
 ocimgr delete-compartment "Finance" --skip-unauthorized
+ocimgr delete-compartment "Finance" --no-skip-unauthorized
 ```
 
 ### Delete a compartment by OCID (with confirmation)

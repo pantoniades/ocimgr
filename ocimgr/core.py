@@ -18,6 +18,7 @@ import oci
 from oci.config import from_file
 from concurrent.futures import ThreadPoolExecutor
 import time
+from datetime import datetime
 
 
 # Registry for resource types
@@ -294,6 +295,7 @@ class AsyncOCISession:
         self._clients: Dict[str, Dict[str, Any]] = {}
         self._current_region = self.regions[0] if self.regions else 'us-ashburn-1'
         self._executor = ThreadPoolExecutor(max_workers=max_concurrent_regions * 2)
+        self._unauthorized_regions: set[str] = set()
         self._init_task: Optional[asyncio.Task] = None
         
         # Initialize clients for all regions
@@ -381,6 +383,19 @@ class AsyncOCISession:
     def get_all_regions(self) -> List[str]:
         """Get list of all configured regions"""
         return self.regions.copy()
+
+    def mark_region_unauthorized(self, region: str) -> None:
+        """Record a region as unauthorized to avoid repeated calls."""
+        if region in self.regions:
+            self._unauthorized_regions.add(region)
+
+    def is_region_authorized(self, region: str) -> bool:
+        """Return True if region is not marked unauthorized."""
+        return region not in self._unauthorized_regions
+
+    def get_authorized_regions(self) -> List[str]:
+        """Return regions excluding those marked unauthorized."""
+        return [region for region in self.regions if region not in self._unauthorized_regions]
     
     async def execute_across_regions(
         self, 
@@ -426,7 +441,12 @@ class AsyncOCISession:
     
     async def close(self) -> None:
         """Clean up resources"""
-        self._executor.shutdown(wait=True)
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except KeyboardInterrupt:
+            # Allow Ctrl-C to exit without noisy shutdown tracebacks
+            logging.warning("Executor shutdown interrupted by user")
+            self._executor.shutdown(wait=False)
 
 
 class ResourceDiscoveryEngine:
@@ -443,7 +463,7 @@ class ResourceDiscoveryEngine:
         self, 
         compartment_ids: List[str],
         resource_type_filter: Optional[List[str]] = None,
-        skip_unauthorized: bool = False
+        skip_unauthorized: bool = True
     ) -> Dict[str, List[AbstractOCIResource]]:
         """
         Discover all resources across compartments and regions.
@@ -524,7 +544,7 @@ class ResourceDiscoveryEngine:
         resource_class: Type[AbstractOCIResource], 
         compartment_id: str,
         resource_type_name: str,
-        skip_unauthorized: bool = False
+        skip_unauthorized: bool = True
     ) -> List[AbstractOCIResource]:
         """
         Discover resources of a specific type with error handling.
@@ -566,8 +586,16 @@ class ResourceDiscoveryEngine:
 
 
 # Modern async logging setup
-async def setup_async_logging(log_file: str = "ocimgr.log", level: str = "INFO") -> None:
-    """Setup async-compatible logging configuration"""
+def generate_default_log_filename(prefix: str = "ocimgr") -> str:
+    """Generate a unique log filename for the current run."""
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{prefix}-{timestamp}.log"
+
+
+async def setup_async_logging(log_file: Optional[str] = None, level: str = "INFO") -> str:
+    """Setup async-compatible logging configuration and return the log filename used."""
+    if not log_file:
+        log_file = generate_default_log_filename()
     log_level = getattr(logging, level.upper())
     
     # Create formatters
@@ -596,9 +624,10 @@ async def setup_async_logging(log_file: str = "ocimgr.log", level: str = "INFO")
     )
     
     logging.info(f"Async logging initialized - Level: {level}, File: {log_file}")
+    return log_file
 
 
-def setup_logging(log_file: str = "ocimgr.log", level: str = "INFO") -> None:
+def setup_logging(log_file: Optional[str] = None, level: str = "INFO") -> None:
     """Synchronous wrapper for logging setup"""
     asyncio.create_task(setup_async_logging(log_file, level))
 

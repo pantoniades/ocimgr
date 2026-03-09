@@ -33,24 +33,30 @@ class CompartmentManager:
         compartments = []
         
         try:
-            identity_client = await self.session.get_client('identity')
+            # Always use the configured home region for identity to avoid timeouts
+            identity_region = self.session.oci_config.get('region')
+            identity_client = await self.session.get_client('identity', identity_region)
             
             if parent_compartment_id is None:
                 # Get tenancy ID as root compartment
-                user_response = await AsyncResourceMixin._run_oci_operation(
-                    identity_client.get_user,
-                    self.session.oci_config['user']
-                )
+                async def get_user_operation():
+                    return await AsyncResourceMixin._run_oci_operation(
+                        identity_client.get_user,
+                        self.session.oci_config['user']
+                    )
+                user_response = await run_with_backoff(get_user_operation, max_retries=6, base_delay=1.0)
                 parent_compartment_id = user_response.data.compartment_id
             
             # List compartments (paginated)
-            list_response = await AsyncResourceMixin._run_oci_operation(
-                oci.pagination.list_call_get_all_results,
-                identity_client.list_compartments,
-                compartment_id=parent_compartment_id,
-                access_level="ANY",
-                compartment_id_in_subtree=True
-            )
+            async def list_operation():
+                return await AsyncResourceMixin._run_oci_operation(
+                    oci.pagination.list_call_get_all_results,
+                    identity_client.list_compartments,
+                    compartment_id=parent_compartment_id,
+                    access_level="ANY",
+                    compartment_id_in_subtree=True
+                )
+            list_response = await run_with_backoff(list_operation, max_retries=6, base_delay=1.0)
 
             for compartment in list_response.data:
                 if compartment.lifecycle_state == 'ACTIVE':
@@ -64,10 +70,12 @@ class CompartmentManager:
                     })
             
             # Also include the root compartment
-            root_response = await AsyncResourceMixin._run_oci_operation(
-                identity_client.get_compartment,
-                parent_compartment_id
-            )
+            async def get_compartment_operation():
+                return await AsyncResourceMixin._run_oci_operation(
+                    identity_client.get_compartment,
+                    parent_compartment_id
+                )
+            root_response = await run_with_backoff(get_compartment_operation, max_retries=6, base_delay=1.0)
             root_compartment = root_response.data
             compartments.insert(0, {
                 'id': root_compartment.id,
@@ -137,12 +145,15 @@ class CompartmentManager:
             Compartment details dictionary or None if not found
         """
         try:
-            identity_client = await self.session.get_client('identity')
+            identity_region = self.session.oci_config.get('region')
+            identity_client = await self.session.get_client('identity', identity_region)
             
-            compartment_response = await AsyncResourceMixin._run_oci_operation(
-                identity_client.get_compartment,
-                compartment_id
-            )
+            async def get_compartment_operation():
+                return await AsyncResourceMixin._run_oci_operation(
+                    identity_client.get_compartment,
+                    compartment_id
+                )
+            compartment_response = await run_with_backoff(get_compartment_operation, max_retries=6, base_delay=1.0)
             
             compartment = compartment_response.data
             
@@ -184,14 +195,17 @@ class CompartmentManager:
         current_id = compartment_id
         
         try:
-            identity_client = await self.session.get_client('identity')
+            identity_region = self.session.oci_config.get('region')
+            identity_client = await self.session.get_client('identity', identity_region)
             
             # Walk up the hierarchy
             while current_id:
-                compartment_response = await AsyncResourceMixin._run_oci_operation(
-                    identity_client.get_compartment,
-                    current_id
-                )
+                async def get_compartment_operation():
+                    return await AsyncResourceMixin._run_oci_operation(
+                        identity_client.get_compartment,
+                        current_id
+                    )
+                compartment_response = await run_with_backoff(get_compartment_operation, max_retries=6, base_delay=1.0)
                 
                 compartment = compartment_response.data
                 hierarchy.insert(0, {  # Insert at beginning to build path from root
