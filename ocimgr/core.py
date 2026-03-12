@@ -55,11 +55,17 @@ class AsyncResourceMixin:
         poll_interval: int = 5
     ) -> bool:
         """Wait for a resource to reach one of the target states"""
+        from ocimgr.utils import run_with_backoff
+
         start_time = time.time()
+        log_interval = max(poll_interval, 15)
+        last_log = start_time
         
         while (time.time() - start_time) < max_wait:
             try:
-                response = await AsyncResourceMixin._run_oci_operation(get_operation)
+                response = await run_with_backoff(
+                    lambda: AsyncResourceMixin._run_oci_operation(get_operation)
+                )
                 
                 if hasattr(response, 'data') and hasattr(response.data, 'lifecycle_state'):
                     current_state = response.data.lifecycle_state
@@ -68,6 +74,17 @@ class AsyncResourceMixin:
                         return True
                 else:
                     logging.warning("Response does not have expected lifecycle_state attribute")
+
+                now = time.time()
+                if now - last_log >= log_interval:
+                    logging.info(
+                        "Waiting for state %s (current=%s, elapsed=%ds/%ds)",
+                        target_states,
+                        current_state,
+                        int(now - start_time),
+                        max_wait
+                    )
+                    last_log = now
                 
                 await asyncio.sleep(poll_interval)
                 

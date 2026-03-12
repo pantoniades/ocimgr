@@ -15,7 +15,7 @@ import os
 import asyncio
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union
+from typing import List, Dict, Any, Optional, Union, Callable
 from dataclasses import asdict
 from enum import Enum
 import click
@@ -346,7 +346,14 @@ class OCIMgrAsyncCLI:
                     ),
                     timeout=request_timeout
                 )
-                return region, len(response.data)
+                terminal_states = {"TERMINATED", "TERMINATING", "DELETED", "DELETING"}
+                active_count = 0
+                for item in response.data:
+                    lifecycle_state = getattr(item, "lifecycle_state", None)
+                    if lifecycle_state and str(lifecycle_state).upper() in terminal_states:
+                        continue
+                    active_count += 1
+                return region, active_count
 
             async with semaphore:
                 try:
@@ -433,7 +440,11 @@ class OCIMgrAsyncCLI:
         except asyncio.CancelledError:
             click.echo("\r" + " " * 30 + "\r", nl=False)  # Clear the line
     
-    async def create_deletion_plan(self, resources: List[AbstractOCIResource]) -> List[AbstractOCIResource]:
+    async def create_deletion_plan(
+        self,
+        resources: List[AbstractOCIResource],
+        balance_by_region: bool = False
+    ) -> List[AbstractOCIResource]:
         """
         Create an optimized deletion plan with dependency analysis.
         
@@ -451,6 +462,10 @@ class OCIMgrAsyncCLI:
             resources, 
             key=lambda r: (r.get_deletion_order_priority(), r.get_estimated_deletion_time())
         )
+
+        if balance_by_region:
+            sorted_resources = self._balance_deletion_plan_by_region(sorted_resources)
+            click.echo("🌍 Balanced deletion plan by region (round-robin) within each deletion phase")
         
         click.echo(f"\n📋 Deletion Plan ({len(sorted_resources)} resources):")
         click.echo("=" * 60)
@@ -486,11 +501,43 @@ class OCIMgrAsyncCLI:
             click.echo("🔒 Resources with delete protection will be processed first")
         
         return sorted_resources
+
+    @staticmethod
+    def _balance_deletion_plan_by_region(
+        resources: List[AbstractOCIResource]
+    ) -> List[AbstractOCIResource]:
+        """Round-robin resources by region within each deletion order phase."""
+        if not resources:
+            return []
+
+        by_order: Dict[int, Dict[str, List[AbstractOCIResource]]] = {}
+        for resource in resources:
+            order = resource.get_deletion_order_priority()
+            region = resource.info.region or "unknown"
+            by_order.setdefault(order, {}).setdefault(region, []).append(resource)
+
+        balanced: List[AbstractOCIResource] = []
+        for order in sorted(by_order.keys()):
+            region_groups = by_order[order]
+            for region_items in region_groups.values():
+                region_items.sort(key=lambda r: r.get_estimated_deletion_time())
+
+            regions = sorted(region_groups.keys())
+            while any(region_groups[region] for region in regions):
+                for region in regions:
+                    if region_groups[region]:
+                        balanced.append(region_groups[region].pop(0))
+
+        return balanced
     
     async def execute_deletion(
         self, 
         resources: List[AbstractOCIResource], 
-        dry_run: bool = True
+        dry_run: bool = True,
+        delete_concurrency: int = 3,
+        delete_retry_max: int = 6,
+        delete_retry_base_delay: float = 0.75,
+        delete_retry_max_delay: float = 12.0
     ) -> Dict[str, Any]:
         """
         Execute resource deletion with async progress tracking.
@@ -523,36 +570,58 @@ class OCIMgrAsyncCLI:
         results = []
         
         try:
-            # Process resources with controlled concurrency
-            semaphore = asyncio.Semaphore(3)  # Max 3 concurrent deletions
+            current_concurrency = max(1, delete_concurrency)
+            throttle_detected = False
             
+            def on_retry(exc: Exception, delay: float, attempt: int) -> None:
+                nonlocal throttle_detected
+                error_str = str(exc)
+                if "429" in error_str or "Circuit" in error_str:
+                    throttle_detected = True
+
             async def process_resource(i: int, resource: AbstractOCIResource) -> OperationResult:
-                async with semaphore:
-                    tracker.start_item(i)
-                    
-                    if dry_run:
-                        # Simulate dry run
-                        click.echo(f"[DRY RUN] Would delete {resource.info.resource_type}: {resource.info.name}")
-                        await asyncio.sleep(0.1)  # Simulate processing
-                        
-                        result = OperationResult(
-                            resource_ocid=resource.info.ocid,
-                            operation="dry_run_delete",
-                            status=ResourceStatus.COMPLETED,
-                            message="Dry run successful"
-                        )
-                        tracker.complete_item(i)
-                        return result
-                    else:
-                        return await self._delete_single_resource(resource, i, tracker)
+                tracker.start_item(i)
+                
+                if dry_run:
+                    click.echo(f"[DRY RUN] Would delete {resource.info.resource_type}: {resource.info.name}")
+                    await asyncio.sleep(0.1)
+                    result = OperationResult(
+                        resource_ocid=resource.info.ocid,
+                        operation="dry_run_delete",
+                        status=ResourceStatus.COMPLETED,
+                        message="Dry run successful"
+                    )
+                    tracker.complete_item(i)
+                    return result
+
+                return await self._delete_single_resource(
+                    resource,
+                    i,
+                    tracker,
+                    delete_retry_max=delete_retry_max,
+                    delete_retry_base_delay=delete_retry_base_delay,
+                    delete_retry_max_delay=delete_retry_max_delay,
+                    on_retry=on_retry
+                )
             
-            # Execute deletions
-            deletion_tasks = [
-                process_resource(i, resource) 
-                for i, resource in enumerate(resources)
-            ]
-            
-            results = await asyncio.gather(*deletion_tasks, return_exceptions=True)
+            index = 0
+            while index < len(resources):
+                throttle_detected = False
+                batch = resources[index:index + current_concurrency]
+                deletion_tasks = [
+                    process_resource(i, resource)
+                    for i, resource in enumerate(batch, start=index)
+                ]
+                batch_results = await asyncio.gather(*deletion_tasks, return_exceptions=True)
+                results.extend(batch_results)
+                
+                if throttle_detected and current_concurrency > 1:
+                    current_concurrency = max(1, current_concurrency - 1)
+                    click.echo(
+                        f"⚠️  Throttling detected. Reducing delete concurrency to {current_concurrency}"
+                    )
+                
+                index += len(batch)
             
         except asyncio.CancelledError:
             click.echo("\n⚠️ Deletion cancelled by user")
@@ -591,15 +660,60 @@ class OCIMgrAsyncCLI:
         self, 
         resource: AbstractOCIResource, 
         index: int, 
-        tracker: ProgressTracker
+        tracker: ProgressTracker,
+        delete_retry_max: int = 6,
+        delete_retry_base_delay: float = 0.75,
+        delete_retry_max_delay: float = 12.0,
+        on_retry: Optional[Callable[[Exception, float, int], None]] = None
     ) -> OperationResult:
         """Delete a single resource with error handling"""
         try:
             click.echo(f"🗑️  Deleting {resource.info.resource_type}: {resource.info.name}")
+
+            # Refresh lifecycle state before acting
+            try:
+                client_map = {
+                    "compute_instance": ("compute", "get_instance", "instance_id"),
+                    "autonomous_database": ("database", "get_autonomous_database", "autonomous_database_id"),
+                    "mysql_db_system": ("mysql", "get_db_system", "db_system_id"),
+                    "oke_cluster": ("container_engine", "get_cluster", "cluster_id")
+                }
+                service, method_name, id_param = client_map.get(
+                    resource.info.resource_type,
+                    (None, None, None)
+                )
+                if service:
+                    client = await self.session.get_client(service, resource.info.region)
+                    method = getattr(client, method_name)
+                    response = await run_with_backoff(
+                        lambda: AsyncResourceMixin._run_oci_operation(
+                            method,
+                            **{id_param: resource.info.ocid}
+                        ),
+                        max_retries=delete_retry_max,
+                        base_delay=delete_retry_base_delay,
+                        max_delay=delete_retry_max_delay,
+                        on_retry=on_retry
+                    )
+                    if hasattr(response, "data") and hasattr(response.data, "lifecycle_state"):
+                        resource.info.lifecycle_state = response.data.lifecycle_state
+            except Exception as exc:
+                logging.debug(
+                    "Unable to refresh state for %s %s: %s",
+                    resource.info.resource_type,
+                    resource.info.ocid,
+                    exc
+                )
             
             # Step 1: Disable delete protection
             if resource.info.has_delete_protection:
-                protection_result = await resource.disable_delete_protection()
+                protection_result = await run_with_backoff(
+                    resource.disable_delete_protection,
+                    max_retries=delete_retry_max,
+                    base_delay=delete_retry_base_delay,
+                    max_delay=delete_retry_max_delay,
+                    on_retry=on_retry
+                )
                 
                 match protection_result.status:
                     case ResourceStatus.COMPLETED:
@@ -612,7 +726,13 @@ class OCIMgrAsyncCLI:
                         return protection_result
             
             # Step 2: Perform deletion
-            deletion_result = await resource.delete()
+            deletion_result = await run_with_backoff(
+                resource.delete,
+                max_retries=delete_retry_max,
+                base_delay=delete_retry_base_delay,
+                max_delay=delete_retry_max_delay,
+                on_retry=on_retry
+            )
             
             match deletion_result.status:
                 case ResourceStatus.COMPLETED:
@@ -1837,11 +1957,19 @@ async def inventory_command(
 @click.option('--dry-run', is_flag=True, help='Show deletion plan only (no changes)')
 @click.option('--yes', is_flag=True, help='Skip confirmation prompts')
 @click.option('--max-concurrent', type=int, default=3, help='Max concurrent API calls per compartment')
+@click.option('--compartment-concurrency', type=int, default=2,
+              help='Max concurrent target compartments to process')
 @click.option('--delete-retry-max', type=int, default=6, help='Max delete retries when throttled')
 @click.option('--delete-retry-base-delay', type=float, default=0.75, help='Base delay (seconds) for delete backoff')
 @click.option('--delete-retry-max-delay', type=float, default=12.0, help='Max delay (seconds) for delete backoff')
 @click.option('--compartment-delay', type=float, default=0.0, help='Delay (seconds) between compartment deletes')
 @click.option('--target-delay', type=float, default=0.0, help='Delay (seconds) between target compartments')
+@click.option('--retry-pass-delay', type=float, default=120.0,
+              help='Delay (seconds) between resource cleanup and compartment delete retry pass')
+@click.option('--compartment-delete-passes', type=int, default=2,
+              help='Number of compartment delete passes to attempt')
+@click.option('--verify-cleanup/--no-verify-cleanup', default=True,
+              help='Re-discover resources before deleting compartments (default: on)')
 @click.option('--discover-regions', is_flag=True, help='Rebuild cached regions from OCI')
 @click.option('--skip-unauthorized/--no-skip-unauthorized', default=True,
               help='Skip 401/403 unauthorized regions (default: on)')
@@ -1857,11 +1985,15 @@ async def delete_compartment_command(
     dry_run,
     yes,
     max_concurrent,
+    compartment_concurrency,
     delete_retry_max,
     delete_retry_base_delay,
     delete_retry_max_delay,
     compartment_delay,
     target_delay,
+    retry_pass_delay,
+    compartment_delete_passes,
+    verify_cleanup,
     discover_regions,
     skip_unauthorized,
     verbose
@@ -1875,6 +2007,13 @@ async def delete_compartment_command(
         ctx.obj['profile'],
         ctx.obj['log_level']
     )
+
+    was_cancelled = False
+    deleted_count = 0
+    failed_count = 0
+    resource_deleted_total = 0
+    resource_failed_total = 0
+    resource_target_total = 0
 
     try:
         await cli_app.initialize()
@@ -2015,6 +2154,10 @@ async def delete_compartment_command(
         resource_target_total = 0
         was_cancelled = False
         skipped_protected: Dict[str, Dict[str, Any]] = {}
+        skipped_protected_resources: List[Dict[str, Any]] = []
+        pending_deletions: List[Dict[str, Any]] = []
+        mysql_db_systems: List[Dict[str, Any]] = []
+        failed_resource_deletions: List[Dict[str, Any]] = []
 
         def print_running_totals(label: str = "Running") -> None:
             click.echo(
@@ -2029,225 +2172,203 @@ async def delete_compartment_command(
         if verbose:
             click.echo("🔀 Randomized target processing order to reduce repeated blocking patterns.")
 
-        for target in randomized_targets:
-            target_compartment = None
-            if target.startswith("ocid1.compartment"):
-                target_compartment = next(
-                    (comp for comp in all_compartments if comp['id'] == target),
-                    None
-                )
-            else:
-                search_term = target.lower()
-                matches = [
-                    comp for comp in all_compartments
-                    if search_term in comp['name'].lower()
-                ]
-                if matches:
-                    matches.sort(
-                        key=lambda c: (c['name'].lower().startswith(search_term), c['name']),
-                        reverse=True
-                    )
-                    target_compartment = matches[0]
-
-            if not target_compartment:
-                click.echo(f"❌ Compartment '{target}' not found.")
-                logging.warning(f"Target compartment not found: {target}")
-                delete_success = False
-                remaining_targets.append(target)
-                continue
-
-            scoped_compartments = [
-                comp for comp in all_compartments
-                if is_descendant(comp['id'], target_compartment['id'])
-            ]
-
-            def get_depth(compartment_id: str) -> int:
-                depth = 0
-                current = compartment_id
-                while current and current in parent_map:
-                    parent_id = parent_map.get(current)
-                    if not parent_id or parent_id == current:
-                        break
-                    depth += 1
-                    current = parent_id
-                return depth
-
-            scoped_compartments = sorted(
-                scoped_compartments,
-                key=lambda comp: get_depth(comp['id']),
-                reverse=True
-            )
-
-            logging.info(
-                f"Processing target compartment {target_compartment['name']} with {len(scoped_compartments)} total in subtree"
-            )
+        if not yes and not dry_run and compartment_concurrency > 1:
             click.echo(
-                f"🎯 Target compartment: {target_compartment['name']}"
-                f" ({len(scoped_compartments)} compartments in subtree)"
+                "⚠️  Interactive prompts detected; forcing --compartment-concurrency to 1."
             )
+            compartment_concurrency = 1
 
-            compartment_ids = [comp['id'] for comp in scoped_compartments]
+        target_semaphore = asyncio.Semaphore(max(1, compartment_concurrency))
+        state_lock = asyncio.Lock()
+        concurrency_state = {"max": max_concurrent}
 
-            click.echo("🔍 Discovering resources for deletion plan...")
-
-            async def attempt_discovery(retries:int=3) -> dict:
-                """Try discovery repeatedly when we hit rate limits or circuits.
-
-                Returns the resources dict on success or raises on final failure.
-                """
-                nonlocal max_concurrent
-                for attempt in range(1, retries+1):
-                    try:
-                        return await cli_app.discover_resources(
-                            compartment_ids,
-                            skip_unauthorized=skip_unauthorized
-                        )
-                    except Exception as ee:
-                        errstr = str(ee)
-                        if "Circuit" in errstr or "429" in errstr:
-                            click.echo(f"⚠️  Service rate limited or circuit open (attempt {attempt}): {ee}")
-                            # reduce concurrency on either event to slow overall pace
-                            new_max = max(1, max_concurrent - 1)
-                            if new_max < max_concurrent:
-                                click.echo(f"⚠️  Reducing --max-concurrent from {max_concurrent} to {new_max} due to throttling/circuit")
-                                logging.warning(f"Concurrency reduced: {max_concurrent} → {new_max} due to {errstr[:80]}" )
-                                max_concurrent = new_max
-                            # pause before retrying
-                            if attempt < retries:
-                                wait = 30
-                                click.echo(f"⏳  Pausing {wait}s before retrying discovery...")
-                                await asyncio.sleep(wait)
-                                continue
-                        # not a rate/circuit error or no retries left
-                        raise
-                # unreachable
-            
-            try:
-                resources_by_compartment = await attempt_discovery()
-            except Exception as e:
-                # final failure after retries
-                click.echo(f"⚠️  Still rate limited after retries: {e}")
-                click.echo(f"❌ Cannot proceed with compartment deletion. Remaining targets saved.")
-                remaining_targets.append(target)
-                delete_success = False
-                continue
-
-            all_resources = []
-            for resources in resources_by_compartment.values():
-                all_resources.extend(resources)
-
-            protected_resources = [r for r in all_resources if r.info.has_delete_protection]
-            if skip_protected and protected_resources:
-                skipped_protected[target_compartment['id']] = {
-                    'target': target,
-                    'qualified_path': get_qualified_path(target_compartment['id']),
-                    'resources': [
-                        {
-                            'resource_type': r.info.resource_type,
-                            'name': r.info.name,
-                            'region': r.info.region,
-                            'ocid': r.info.ocid,
-                            'compartment_id': r.info.compartment_id
-                        }
-                        for r in protected_resources
+        async def process_target(target: str) -> None:
+            nonlocal delete_success
+            nonlocal resource_target_total
+            nonlocal resource_deleted_total
+            nonlocal resource_failed_total
+            async with target_semaphore:
+                target_compartment = None
+                if target.startswith("ocid1.compartment"):
+                    target_compartment = next(
+                        (comp for comp in all_compartments if comp['id'] == target),
+                        None
+                    )
+                else:
+                    search_term = target.lower()
+                    matches = [
+                        comp for comp in all_compartments
+                        if search_term in comp['name'].lower()
                     ]
-                }
-                click.echo(
-                    f"⚠️  Skipping {target_compartment['name']} due to delete-protected resources "
-                    f"({len(protected_resources)})."
+                    if matches:
+                        matches.sort(
+                            key=lambda c: (c['name'].lower().startswith(search_term), c['name']),
+                            reverse=True
+                        )
+                        target_compartment = matches[0]
+
+                if not target_compartment:
+                    click.echo(f"❌ Compartment '{target}' not found.")
+                    logging.warning(f"Target compartment not found: {target}")
+                    async with state_lock:
+                        delete_success = False
+                        remaining_targets.append(target)
+                    return
+
+                scoped_compartments = [
+                    comp for comp in all_compartments
+                    if is_descendant(comp['id'], target_compartment['id'])
+                ]
+
+                def get_depth(compartment_id: str) -> int:
+                    depth = 0
+                    current = compartment_id
+                    while current and current in parent_map:
+                        parent_id = parent_map.get(current)
+                        if not parent_id or parent_id == current:
+                            break
+                        depth += 1
+                        current = parent_id
+                    return depth
+
+                scoped_compartments = sorted(
+                    scoped_compartments,
+                    key=lambda comp: get_depth(comp['id']),
+                    reverse=True
                 )
-                remaining_targets.append(target)
-                delete_success = False
-                continue
 
-            if not all_resources:
-                click.echo("📭 No resources found in selected compartments.")
-                click.echo("🗑️ Directly deleting empty compartments (no resource cleanup needed)...")
-                logging.info(f"No resources found in subtree for {target_compartment['id']}")
-                target_deleted = True
-                failed_compartments: set[str] = set()
+                logging.info(
+                    f"Processing target compartment {target_compartment['name']} with {len(scoped_compartments)} total in subtree"
+                )
+                click.echo(
+                    f"🎯 Target compartment: {target_compartment['name']}"
+                    f" ({len(scoped_compartments)} compartments in subtree)"
+                )
 
-                def has_failed_descendant(comp_id: str) -> bool:
-                    return any(
-                        failed_id != comp_id and is_descendant(failed_id, comp_id)
-                        for failed_id in failed_compartments
-                    )
+                compartment_ids = [comp['id'] for comp in scoped_compartments]
 
-                for index, comp in enumerate(scoped_compartments, start=1):
-                    click.echo(
-                        f"🔁 Deleting compartment {index} of {len(scoped_compartments)}: {comp.get('name','<unknown>')}"
-                    )
-                    # For empty compartments, skip resource deletion entirely
-                    if comp['id'] == target_compartment['id'] or comp.get('parent_id'):
-                        if has_failed_descendant(comp['id']):
-                            target_deleted = False
-                            failed_count += 1
-                            failed_compartments.add(comp['id'])
-                            delete_success = False
-                            click.echo(
-                                f"⚠️  Skipping {comp['name']} because a child compartment failed to delete."
-                            )
-                            print_running_totals("Skipped")
-                            continue
+                click.echo("🔍 Discovering resources for deletion plan...")
 
-                        async def delete_operation() -> bool:
-                            return await cli_app.compartment_manager.delete_compartment(
-                                comp['id'],
-                                region=delete_region
-                            )
+                async def attempt_discovery(retries: int = 3) -> dict:
+                    """Try discovery repeatedly when we hit rate limits or circuits.
 
+                    Returns the resources dict on success or raises on final failure.
+                    """
+                    for attempt in range(1, retries + 1):
                         try:
-                            success = await run_with_backoff(
-                                delete_operation,
-                                max_retries=delete_retry_max,
-                                base_delay=delete_retry_base_delay,
-                                max_delay=delete_retry_max_delay
+                            return await cli_app.discover_resources(
+                                compartment_ids,
+                                skip_unauthorized=skip_unauthorized
                             )
-                        except Exception as e:
-                            success = False
-                            error_str = str(e)
-                            if "429" in error_str:
-                                # Reduce concurrency on rate limit
-                                new_max = max(1, max_concurrent - 1)
-                                click.echo(f"⚠️  Rate limited (429). Reducing --max-concurrent from {max_concurrent} to {new_max}")
-                                logging.warning(f"Rate limit (429) detected. Reduced concurrency: {max_concurrent} → {new_max}")
-                                max_concurrent = new_max
-                                # pause briefly to allow throttling to ease
-                                click.echo("⏳  Sleeping 30s after rate limit before continuing")
-                                await asyncio.sleep(30)
-                            elif "Circuit" in error_str and "OPEN" in error_str:
-                                logging.error(f"Circuit breaker opened for compartment deletion: {error_str}")
-                                click.echo("⏳  Circuit breaker open; waiting 30s before next delete")
-                                await asyncio.sleep(30)
-                            if verbose:
-                                click.echo(f"⚠️  Retry exhausted for {comp['name']}: {e}")
+                        except Exception as ee:
+                            errstr = str(ee)
+                            if "Circuit" in errstr or "429" in errstr:
+                                click.echo(
+                                    f"⚠️  Service rate limited or circuit open (attempt {attempt}): {ee}"
+                                )
+                                async with state_lock:
+                                    current_max = concurrency_state["max"]
+                                    new_max = max(1, current_max - 1)
+                                    if new_max < current_max:
+                                        concurrency_state["max"] = new_max
+                                        click.echo(
+                                            f"⚠️  Reducing --max-concurrent from {current_max} to {new_max} due to throttling/circuit"
+                                        )
+                                        logging.warning(
+                                            "Concurrency reduced: %s → %s due to %s",
+                                            current_max,
+                                            new_max,
+                                            errstr[:80]
+                                        )
+                                if attempt < retries:
+                                    wait = 30
+                                    click.echo(f"⏳  Pausing {wait}s before retrying discovery...")
+                                    await asyncio.sleep(wait)
+                                    continue
+                            raise
 
-                        if success:
-                            deleted_count += 1
-                            logging.info(f"✅ Deleted compartment: {comp.get('name')} ({comp['id']})")
-                        else:
-                            delete_success = False
-                            target_deleted = False
-                            failed_count += 1
-                            failed_compartments.add(comp['id'])
-                            click.echo(f"❌ Failed to delete compartment {comp['name']}")
-                            logging.warning(
-                                f"❌ Failed to delete compartment: {comp.get('name')} ({comp['id']})"
-                            )
+                try:
+                    resources_by_compartment = await attempt_discovery()
+                except Exception as e:
+                    click.echo(f"⚠️  Still rate limited after retries: {e}")
+                    click.echo(f"❌ Cannot proceed with compartment deletion. Remaining targets saved.")
+                    async with state_lock:
+                        remaining_targets.append(target)
+                        delete_success = False
+                    return
 
-                        print_running_totals()
+                all_resources = []
+                for resources in resources_by_compartment.values():
+                    all_resources.extend(resources)
 
-                        if compartment_delay > 0 and index < len(scoped_compartments):
-                            await asyncio.sleep(compartment_delay)
+                async with state_lock:
+                    for resource in all_resources:
+                        if resource.info.resource_type == "mysql_db_system":
+                            mysql_db_systems.append({
+                                "compartment_path": get_qualified_path(resource.info.compartment_id),
+                                "compartment_id": resource.info.compartment_id,
+                                "name": resource.info.name,
+                                "region": resource.info.region,
+                                "ocid": resource.info.ocid,
+                                "protected": resource.info.has_delete_protection
+                            })
 
-                if target_delay > 0:
-                    await asyncio.sleep(target_delay)
+                protected_resources = [r for r in all_resources if r.info.has_delete_protection]
+                if skip_protected and protected_resources:
+                    async with state_lock:
+                        skipped_protected[target_compartment['id']] = {
+                            'target': target,
+                            'qualified_path': get_qualified_path(target_compartment['id']),
+                            'resources': [
+                                {
+                                    'resource_type': r.info.resource_type,
+                                    'name': r.info.name,
+                                    'region': r.info.region,
+                                    'ocid': r.info.ocid,
+                                    'compartment_id': r.info.compartment_id,
+                                    'compartment_path': get_qualified_path(r.info.compartment_id)
+                                }
+                                for r in protected_resources
+                            ]
+                        }
+                        skipped_protected_resources.extend(
+                            skipped_protected[target_compartment['id']]['resources']
+                        )
+                        remaining_targets.append(target)
+                        delete_success = False
+                    click.echo(
+                        f"⚠️  Skipping {target_compartment['name']} due to delete-protected resources "
+                        f"({len(protected_resources)})."
+                    )
+                    return
 
-                if not target_deleted:
-                    remaining_targets.append(target)
-                continue
-            else:
-                deletion_plan = await cli_app.create_deletion_plan(all_resources)
+                if not all_resources:
+                    click.echo("📭 No resources found in selected compartments.")
+                    click.echo("🗂️ Queueing empty compartments for delete pass (no resource cleanup needed)...")
+                    logging.info(f"No resources found in subtree for {target_compartment['id']}")
+                    if dry_run:
+                        click.echo("🧪 Dry run mode enabled - skipping compartment deletes.")
+                        if target_delay > 0:
+                            await asyncio.sleep(target_delay)
+                        async with state_lock:
+                            remaining_targets.append(target)
+                        return
+
+                    async with state_lock:
+                        pending_deletions.append({
+                            "target": target,
+                            "qualified_path": get_qualified_path(target_compartment['id']),
+                            "target_compartment": target_compartment,
+                            "scoped_compartments": scoped_compartments
+                        })
+                    if target_delay > 0:
+                        await asyncio.sleep(target_delay)
+                    return
+
+                deletion_plan = await cli_app.create_deletion_plan(
+                    all_resources,
+                    balance_by_region=True
+                )
                 protected_resources = [r for r in deletion_plan if r.info.has_delete_protection]
 
                 if protected_resources:
@@ -2255,7 +2376,20 @@ async def delete_compartment_command(
                         f"🔒 {len(protected_resources)} resources have delete protection enabled."
                     )
                     for resource in protected_resources:
-                        click.echo(f"  • {resource.info.resource_type}: {resource.info.name}")
+                        compartment_path = (
+                            get_qualified_path(resource.info.compartment_id)
+                            or resource.info.compartment_id
+                        )
+                        region = resource.info.region or "unknown"
+                        click.echo(
+                            "  • {resource_type}: {name} | {region} | {compartment_path} | {ocid}".format(
+                                resource_type=resource.info.resource_type,
+                                name=resource.info.name,
+                                region=region,
+                                compartment_path=compartment_path,
+                                ocid=resource.info.ocid
+                            )
+                        )
 
                     if dry_run:
                         click.echo("🧪 Dry run mode enabled - delete protection will NOT be disabled.")
@@ -2264,8 +2398,9 @@ async def delete_compartment_command(
                             "Disable delete protection for these resources and continue?"
                         ):
                             click.echo("❌ Operation cancelled.")
-                            delete_success = False
-                            continue
+                            async with state_lock:
+                                delete_success = False
+                            return
 
                 if dry_run:
                     click.echo("🧪 Dry run mode enabled - no changes will be made.")
@@ -2276,101 +2411,250 @@ async def delete_compartment_command(
                     ):
                         click.echo("❌ Operation cancelled.")
                         logging.info("User cancelled resource deletion confirmation")
-                        delete_success = False
-                        continue
+                        async with state_lock:
+                            delete_success = False
+                        return
 
                 if not dry_run:
-                    deletion_summary = await cli_app.execute_deletion(deletion_plan, dry_run=False)
-                    resource_target_total += deletion_summary.get("total", 0)
-                    resource_deleted_total += deletion_summary.get("successful", 0)
-                    resource_failed_total += deletion_summary.get("failed", 0)
+                    resource_index = {r.info.ocid: r for r in deletion_plan}
+                    async with state_lock:
+                        delete_concurrency = concurrency_state["max"]
+                    deletion_summary = await cli_app.execute_deletion(
+                        deletion_plan,
+                        dry_run=False,
+                        delete_concurrency=delete_concurrency,
+                        delete_retry_max=delete_retry_max,
+                        delete_retry_base_delay=delete_retry_base_delay,
+                        delete_retry_max_delay=delete_retry_max_delay
+                    )
+                    async with state_lock:
+                        resource_target_total += deletion_summary.get("total", 0)
+                        resource_deleted_total += deletion_summary.get("successful", 0)
+                        resource_failed_total += deletion_summary.get("failed", 0)
+                        for result in deletion_summary.get("results", []):
+                            if result.status == ResourceStatus.FAILED:
+                                resource = resource_index.get(result.resource_ocid)
+                                compartment_path = (
+                                    get_qualified_path(resource.info.compartment_id)
+                                    if resource
+                                    else "unknown"
+                                )
+                                failed_resource_deletions.append({
+                                    "resource_type": resource.info.resource_type if resource else "unknown",
+                                    "name": resource.info.name if resource else "unknown",
+                                    "region": resource.info.region if resource else "unknown",
+                                    "ocid": result.resource_ocid,
+                                    "compartment_path": compartment_path,
+                                    "protected": resource.info.has_delete_protection if resource else False,
+                                    "error": result.message
+                                })
                     print_running_totals()
 
-            if dry_run:
-                click.echo("🧪 Dry run complete. No resources were deleted.")
+                if dry_run:
+                    click.echo("🧪 Dry run complete. No resources were deleted.")
+                    if target_delay > 0:
+                        await asyncio.sleep(target_delay)
+                    async with state_lock:
+                        remaining_targets.append(target)
+                    return
+
+                if not yes:
+                    if not click.confirm(
+                        f"Delete {len(scoped_compartments)} compartments after cleanup?",
+                        default=False
+                    ):
+                        click.echo("❌ Compartment deletion cancelled.")
+                        logging.info("User cancelled compartment deletion prompt")
+                        async with state_lock:
+                            delete_success = False
+                            remaining_targets.append(target)
+                        return
+
+                async with state_lock:
+                    pending_deletions.append({
+                        "target": target,
+                        "qualified_path": get_qualified_path(target_compartment['id']),
+                        "target_compartment": target_compartment,
+                        "scoped_compartments": scoped_compartments
+                    })
                 if target_delay > 0:
                     await asyncio.sleep(target_delay)
-                remaining_targets.append(target)
-                continue
 
-            if not yes:
-                if not click.confirm(
-                    f"Delete {len(scoped_compartments)} compartments after cleanup?",
-                    default=False
-                ):
-                    click.echo("❌ Compartment deletion cancelled.")
-                    logging.info("User cancelled compartment deletion prompt")
-                    delete_success = False
-                    remaining_targets.append(target)
-                    continue
+        target_tasks = [asyncio.create_task(process_target(target)) for target in randomized_targets]
+        target_results = await asyncio.gather(*target_tasks, return_exceptions=True)
+        for result in target_results:
+            if isinstance(result, Exception):
+                logging.error("Target processing failed: %s", result)
 
-            click.echo("🗑️ Deleting compartments (leaf to root, dependency aware)...")
-            target_deleted = True
-            failed_compartments: set[str] = set()
+        async def execute_compartment_deletions() -> None:
+            nonlocal delete_success, deleted_count, failed_count, max_concurrent
+            if not pending_deletions:
+                return
 
-            def has_failed_descendant(comp_id: str) -> bool:
-                return any(
-                    failed_id != comp_id and is_descendant(failed_id, comp_id)
-                    for failed_id in failed_compartments
-                )
+            for pass_index in range(1, max(1, compartment_delete_passes) + 1):
+                if pass_index > 1 and retry_pass_delay > 0:
+                    click.echo(
+                        f"⏳ Waiting {retry_pass_delay:.0f}s before compartment delete pass {pass_index}..."
+                    )
+                    await asyncio.sleep(retry_pass_delay)
 
-            for index, comp in enumerate(scoped_compartments, start=1):
-                # progress indicator
                 click.echo(
-                    f"🔁 Deleting compartment {index} of {len(scoped_compartments)}: {comp.get('name','<unknown>')}"
+                    "🗑️ Starting compartment delete pass "
+                    f"{pass_index}/{max(1, compartment_delete_passes)} (leaf to root, dependency aware)..."
                 )
-                if comp['id'] == target_compartment['id'] or comp.get('parent_id'):
-                    if has_failed_descendant(comp['id']):
-                        target_deleted = False
-                        failed_count += 1
-                        failed_compartments.add(comp['id'])
-                        delete_success = False
+
+                next_pending_deletions: List[Dict[str, Any]] = []
+
+                for entry in pending_deletions:
+                    scoped_compartments = entry["scoped_compartments"]
+                    target_compartment = entry["target_compartment"]
+
+                    if verify_cleanup:
                         click.echo(
-                            f"⚠️  Skipping {comp['name']} because a child compartment failed to delete."
+                            f"🔁 Verifying cleanup for {entry['qualified_path']} before delete pass..."
                         )
-                        print_running_totals("Skipped")
-                        continue
+                        resources_after_cleanup = await cli_app.discover_resources(
+                            [comp['id'] for comp in scoped_compartments],
+                            skip_unauthorized=skip_unauthorized
+                        )
+                        remaining_resources = [
+                            res
+                            for res_list in resources_after_cleanup.values()
+                            for res in res_list
+                        ]
+                        if remaining_resources:
+                            click.echo(
+                                f"⚠️  {len(remaining_resources)} resources still present; deferring compartment delete."
+                            )
+                            remaining_summary = []
+                            for resource in remaining_resources:
+                                remaining_summary.append({
+                                    "resource_type": resource.info.resource_type,
+                                    "name": resource.info.name,
+                                    "region": resource.info.region,
+                                    "ocid": resource.info.ocid,
+                                    "compartment_path": get_qualified_path(resource.info.compartment_id)
+                                    or resource.info.compartment_id
+                                })
+                            click.echo("  Remaining resources (sorted by compartment/region):")
+                            for resource_entry in sorted(
+                                remaining_summary,
+                                key=lambda r: (r.get("compartment_path", ""), r.get("region", ""), r.get("name", ""))
+                            ):
+                                click.echo(
+                                    "    - {resource_type}: {name} | {region} | {compartment_path} | {ocid}".format(**resource_entry)
+                                )
+                            delete_success = False
+                            next_pending_deletions.append(entry)
+                            continue
 
-                    async def delete_operation() -> bool:
-                        return await cli_app.compartment_manager.delete_compartment(
-                            comp['id'],
-                            region=delete_region
+                    click.echo(
+                        f"🎯 Deleting compartment tree for {entry['qualified_path']} "
+                        f"({len(scoped_compartments)} compartments)"
+                    )
+
+                    target_deleted = True
+                    failed_compartments: set[str] = set()
+
+                    def has_failed_descendant(comp_id: str) -> bool:
+                        return any(
+                            failed_id != comp_id and is_descendant(failed_id, comp_id)
+                            for failed_id in failed_compartments
                         )
 
-                    try:
-                        success = await run_with_backoff(
-                            delete_operation,
-                            max_retries=delete_retry_max,
-                            base_delay=delete_retry_base_delay,
-                            max_delay=delete_retry_max_delay
+                    for index, comp in enumerate(scoped_compartments, start=1):
+                        click.echo(
+                            f"🔁 Deleting compartment {index} of {len(scoped_compartments)}: {comp.get('name','<unknown>')}"
                         )
-                    except Exception as e:
-                        success = False
-                        if verbose:
-                            click.echo(f"⚠️ Throttling retry exhausted for {comp['name']}: {e}")
+                        if comp['id'] == target_compartment['id'] or comp.get('parent_id'):
+                            if has_failed_descendant(comp['id']):
+                                target_deleted = False
+                                failed_count += 1
+                                failed_compartments.add(comp['id'])
+                                delete_success = False
+                                click.echo(
+                                    f"⚠️  Skipping {comp['name']} because a child compartment failed to delete."
+                                )
+                                print_running_totals("Skipped")
+                                continue
 
-                    if success:
-                        deleted_count += 1
-                    else:
-                        delete_success = False
-                        target_deleted = False
-                        failed_count += 1
-                        failed_compartments.add(comp['id'])
-                        click.echo(f"❌ Failed to delete compartment {comp['name']}")
-                        logging.warning(
-                            f"Failed to delete compartment {comp.get('name')} ({comp['id']})"
-                        )
+                            async def delete_operation() -> bool:
+                                return await cli_app.compartment_manager.delete_compartment(
+                                    comp['id'],
+                                    region=delete_region
+                                )
 
-                    print_running_totals()
+                            try:
+                                success = await run_with_backoff(
+                                    delete_operation,
+                                    max_retries=delete_retry_max,
+                                    base_delay=delete_retry_base_delay,
+                                    max_delay=delete_retry_max_delay
+                                )
+                            except Exception as e:
+                                success = False
+                                error_str = str(e)
+                                if "429" in error_str:
+                                    new_max = max(1, max_concurrent - 1)
+                                    click.echo(
+                                        f"⚠️  Rate limited (429). Reducing --max-concurrent from {max_concurrent} to {new_max}"
+                                    )
+                                    logging.warning(
+                                        "Rate limit (429) detected. Reduced concurrency: %s → %s",
+                                        max_concurrent,
+                                        new_max
+                                    )
+                                    max_concurrent = new_max
+                                    click.echo("⏳  Sleeping 30s after rate limit before continuing")
+                                    await asyncio.sleep(30)
+                                elif "Circuit" in error_str and "OPEN" in error_str:
+                                    logging.error(
+                                        "Circuit breaker opened for compartment deletion: %s",
+                                        error_str
+                                    )
+                                    click.echo("⏳  Circuit breaker open; waiting 30s before next delete")
+                                    await asyncio.sleep(30)
+                                if verbose:
+                                    click.echo(f"⚠️  Retry exhausted for {comp['name']}: {e}")
 
-                    if compartment_delay > 0 and index < len(scoped_compartments):
-                        await asyncio.sleep(compartment_delay)
+                            if success:
+                                deleted_count += 1
+                                logging.info(
+                                    "✅ Deleted compartment: %s (%s)",
+                                    comp.get('name'),
+                                    comp['id']
+                                )
+                            else:
+                                delete_success = False
+                                target_deleted = False
+                                failed_count += 1
+                                failed_compartments.add(comp['id'])
+                                click.echo(f"❌ Failed to delete compartment {comp['name']}")
+                                logging.warning(
+                                    "Failed to delete compartment %s (%s)",
+                                    comp.get('name'),
+                                    comp['id']
+                                )
 
-            if target_delay > 0:
-                await asyncio.sleep(target_delay)
+                            print_running_totals()
 
-            if not target_deleted:
-                remaining_targets.append(target)
+                            if compartment_delay > 0 and index < len(scoped_compartments):
+                                await asyncio.sleep(compartment_delay)
+
+                    if target_delay > 0:
+                        await asyncio.sleep(target_delay)
+
+                    if not target_deleted:
+                        next_pending_deletions.append(entry)
+
+                pending_deletions.clear()
+                pending_deletions.extend(next_pending_deletions)
+
+                if not pending_deletions:
+                    break
+
+        if not dry_run:
+            await execute_compartment_deletions()
 
         if remaining_file:
             try:
@@ -2383,13 +2667,46 @@ async def delete_compartment_command(
                 delete_success = False
 
         if skipped_protected:
-            click.echo("\n🔒 Targets skipped due to delete-protected databases:")
+            click.echo("\n🔒 Targets skipped due to delete-protected resources:")
             for payload in skipped_protected.values():
                 click.echo(f"  • {payload['qualified_path']}")
-                for resource in payload['resources']:
+            if skipped_protected_resources:
+                click.echo("  Protected resources (sorted by compartment/region):")
+                for resource in sorted(
+                    skipped_protected_resources,
+                    key=lambda r: (r.get("compartment_path", ""), r.get("region", ""), r.get("name", ""))
+                ):
                     click.echo(
-                        "    - {resource_type}: {name} ({region}) {ocid}".format(**resource)
+                        "    - {resource_type}: {name} ({region}) {ocid} [{compartment_path}]".format(**resource)
                     )
+
+        if mysql_db_systems:
+            click.echo("\n🗄️  MySQL DB systems requiring deletion:")
+            for system in sorted(
+                mysql_db_systems,
+                key=lambda s: (s.get("compartment_path", ""), s.get("region", ""), s.get("name", ""))
+            ):
+                protection_flag = " 🔒" if system.get("protected") else ""
+                click.echo(
+                    "  • {compartment_path} | {region} | {name}{protection_flag} | {ocid}".format(
+                        **system,
+                        protection_flag=protection_flag
+                    )
+                )
+
+        if failed_resource_deletions:
+            click.echo("\n⚠️  Resources that failed to delete (manual cleanup needed):")
+            for resource in sorted(
+                failed_resource_deletions,
+                key=lambda r: (r.get("compartment_path", ""), r.get("region", ""), r.get("name", ""))
+            ):
+                protected_flag = " 🔒" if resource.get("protected") else ""
+                click.echo(
+                    "  • {compartment_path} | {region} | {resource_type} | {name}{protected_flag} | {ocid} | {error}".format(
+                        **resource,
+                        protected_flag=protected_flag
+                    )
+                )
 
         click.echo(
             f"\n🔢 Summary: {deleted_count} compartments deleted, {failed_count} failures. "

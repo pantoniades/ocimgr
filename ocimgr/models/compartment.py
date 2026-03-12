@@ -254,6 +254,13 @@ class CompartmentManager:
             )
             lifecycle_state = details_response.data.lifecycle_state
             if lifecycle_state != 'ACTIVE':
+                if lifecycle_state in {'DELETING', 'DELETED'}:
+                    logging.info(
+                        "Compartment %s already in state %s; treating as deleted",
+                        compartment_id,
+                        lifecycle_state
+                    )
+                    return True
                 logging.warning(
                     f"Skipping delete for compartment {compartment_id} in state {lifecycle_state}"
                 )

@@ -151,6 +151,17 @@ ocimgr inventory --format csv --output inventory.csv
 ocimgr delete-compartment "Finance" --dry-run
 ```
 
+### Add a delay before compartment deletion pass
+```bash
+ocimgr delete-compartment "Finance" --retry-pass-delay 300
+```
+
+### Control compartment delete passes and cleanup verification
+```bash
+ocimgr delete-compartment "Finance" --compartment-delete-passes 3
+ocimgr delete-compartment "Finance" --no-verify-cleanup
+```
+
 ### Delete a compartment while skipping unauthorized regions
 ```bash
 ocimgr delete-compartment "Finance" --skip-unauthorized
@@ -173,13 +184,17 @@ OCI will throttle list calls under heavy concurrency. Use:
 - Start with `--dry-run` to review the deletion plan.
 - Deletion disables delete-protection automatically when supported.
 - Compartments are deleted **leaf-to-root** after resources are removed.
+- A second pass (or more) deletes compartments after a configurable wait (`--retry-pass-delay`) to
+  allow asynchronous cleanup to settle. Use `--compartment-delete-passes` to attempt more passes.
+- Cleanup verification re-discovers remaining resources before deletion; disable with `--no-verify-cleanup`.
 
 ## How `delete-compartment` Works
 1. **Resolve target** by OCID or name (name searches and includes subtree).
 2. **Discover resources** across the target compartment and descendants.
-3. **Build deletion plan** ordered by dependency (`DeletionOrder`).
+3. **Build deletion plan** ordered by dependency (`DeletionOrder`) and balanced round-robin by region.
 4. **Disable delete protection** where supported before deletion.
-5. **Delete resources**, then delete compartments **leaf-to-root**.
+5. **Delete resources**, queue compartments for deletion, verify cleanup, then delete compartments
+   **leaf-to-root** with configurable passes (`--retry-pass-delay`, `--compartment-delete-passes`).
 
 Use `--dry-run` to validate the plan without making changes.
 

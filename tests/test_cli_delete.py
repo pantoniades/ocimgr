@@ -44,6 +44,7 @@ def test_delete_compartment_confirm_step(monkeypatch, tmp_path):
         catch_exceptions=False,
         obj={'config': None, 'profile': 'DEFAULT', 'log_level': 'INFO'}
     )
+    assert result.exit_code == 0
 
 
 # additional test using the real delete-compartments file if it exists

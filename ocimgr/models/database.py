@@ -513,7 +513,7 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
             # Wait for delete protection to clear (lifecycle state may remain ACTIVE)
             update_success = await self._wait_for_delete_protection_disabled(
                 mysql_client,
-                max_wait=1800  # 30 minutes (delete protection updates can be slow)
+                max_wait=360  # 6 minutes cap for delete protection updates
             )
             
             if not update_success:
@@ -580,10 +580,9 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     )
                     
                     # Wait for HeatWave cluster deletion
-                    heat_wave_deleted = await self._wait_for_state(
-                        lambda: mysql_client.get_heat_wave_cluster(self.info.ocid),
-                        ['DELETED'],
-                        max_wait=1200  # 20 minutes for HeatWave deletion
+                    heat_wave_deleted = await self._wait_for_heat_wave_deleted(
+                        mysql_client,
+                        max_wait=360  # 6 minutes cap for HeatWave deletion
                     )
                     
                     if not heat_wave_deleted:
@@ -616,10 +615,10 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     )
                     
                     # Wait for system to stop
-                    stop_success = await self._wait_for_state(
-                        lambda: mysql_client.get_db_system(self.info.ocid),
+                    stop_success = await self._wait_for_db_state(
+                        mysql_client,
                         ['INACTIVE'],
-                        max_wait=1200  # 20 minutes
+                        max_wait=360  # 6 minutes cap
                     )
                     
                     if not stop_success:
@@ -635,7 +634,15 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                 case 'INACTIVE':
                     # System is already stopped, can delete
                     pass
-                case 'CREATING' | 'UPDATING' | 'DELETING' | 'DELETED':
+                case 'DELETING' | 'DELETED':
+                    return OperationResult(
+                        resource_ocid=self.info.ocid,
+                        operation="delete",
+                        status=ResourceStatus.COMPLETED,
+                        message=f"MySQL system already {self.info.lifecycle_state.lower()}",
+                        duration=time.time() - start_time
+                    )
+                case 'CREATING' | 'UPDATING':
                     error_msg = f"Cannot delete MySQL system in state: {self.info.lifecycle_state}"
                     return OperationResult(
                         resource_ocid=self.info.ocid,
@@ -646,10 +653,10 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     )
                 case _:
                     # Wait for stable state
-                    stable_success = await self._wait_for_state(
-                        lambda: mysql_client.get_db_system(self.info.ocid),
+                    stable_success = await self._wait_for_db_state(
+                        mysql_client,
                         ['ACTIVE', 'INACTIVE'],
-                        max_wait=1200  # 20 minutes
+                        max_wait=360  # 6 minutes cap
                     )
                     
                     if not stable_success:
@@ -681,6 +688,14 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
             )
             
         except ServiceError as e:
+            if getattr(e, "status", None) == 404:
+                return OperationResult(
+                    resource_ocid=self.info.ocid,
+                    operation="delete",
+                    status=ResourceStatus.COMPLETED,
+                    message="MySQL system not found (already deleted)",
+                    duration=time.time() - start_time
+                )
             error_msg = f"OCI API error during deletion: {e}"
             logging.error(f"Error deleting MySQL DB system {self.info.name}: {error_msg}")
             
@@ -714,6 +729,8 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
     ) -> bool:
         """Wait for MySQL delete protection to be disabled (policy DELETE)."""
         start_time = time.time()
+        log_interval = max(poll_interval, 30)
+        last_log = start_time
 
         while (time.time() - start_time) < max_wait:
             try:
@@ -732,8 +749,23 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                     if policy_text == 'DELETE' or is_delete_protected is False:
                         return True
 
+                    now = time.time()
+                    if now - last_log >= log_interval:
+                        logging.info(
+                            "Waiting for delete protection to clear (%s, elapsed=%ds/%ds)",
+                            self.info.name,
+                            int(now - start_time),
+                            max_wait
+                        )
+                        last_log = now
+
                 await asyncio.sleep(poll_interval)
 
+            except ServiceError as e:
+                if getattr(e, "status", None) == 404:
+                    return True
+                logging.warning(f"Error checking delete protection state: {e}")
+                await asyncio.sleep(poll_interval)
             except Exception as e:
                 logging.warning(f"Error checking delete protection state: {e}")
                 await asyncio.sleep(poll_interval)
@@ -741,4 +773,96 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
         logging.warning(
             f"Timeout waiting for delete protection to clear after {max_wait} seconds"
         )
+        return False
+
+    async def _wait_for_db_state(
+        self,
+        mysql_client,
+        target_states: List[str],
+        max_wait: int = 1200,
+        poll_interval: int = 15
+    ) -> bool:
+        """Wait for DB system to reach target states; treat 404 as already gone."""
+        start_time = time.time()
+        log_interval = max(poll_interval, 30)
+        last_log = start_time
+
+        while (time.time() - start_time) < max_wait:
+            try:
+                response = await self._run_oci_operation(
+                    mysql_client.get_db_system,
+                    db_system_id=self.info.ocid
+                )
+                db_system = response.data if hasattr(response, "data") else None
+                if db_system:
+                    current_state = getattr(db_system, "lifecycle_state", None)
+                    if current_state in target_states:
+                        return True
+                    now = time.time()
+                    if now - last_log >= log_interval:
+                        logging.info(
+                            "Waiting for MySQL system %s to reach %s (current=%s, elapsed=%ds/%ds)",
+                            self.info.name,
+                            target_states,
+                            current_state,
+                            int(now - start_time),
+                            max_wait
+                        )
+                        last_log = now
+                await asyncio.sleep(poll_interval)
+            except ServiceError as e:
+                if getattr(e, "status", None) == 404:
+                    return True
+                logging.warning(f"Error checking DB system state: {e}")
+                await asyncio.sleep(poll_interval)
+            except Exception as e:
+                logging.warning(f"Error checking DB system state: {e}")
+                await asyncio.sleep(poll_interval)
+
+        logging.warning(f"Timeout waiting for DB system state {target_states}")
+        return False
+
+    async def _wait_for_heat_wave_deleted(
+        self,
+        mysql_client,
+        max_wait: int = 1200,
+        poll_interval: int = 20
+    ) -> bool:
+        """Wait for HeatWave cluster deletion; treat 404 as already deleted."""
+        start_time = time.time()
+        log_interval = max(poll_interval, 30)
+        last_log = start_time
+
+        while (time.time() - start_time) < max_wait:
+            try:
+                response = await self._run_oci_operation(
+                    mysql_client.get_heat_wave_cluster,
+                    db_system_id=self.info.ocid
+                )
+                cluster = response.data if hasattr(response, "data") else None
+                if cluster:
+                    current_state = getattr(cluster, "lifecycle_state", None)
+                    if current_state == "DELETED":
+                        return True
+                    now = time.time()
+                    if now - last_log >= log_interval:
+                        logging.info(
+                            "Waiting for HeatWave delete on %s (current=%s, elapsed=%ds/%ds)",
+                            self.info.name,
+                            current_state,
+                            int(now - start_time),
+                            max_wait
+                        )
+                        last_log = now
+                await asyncio.sleep(poll_interval)
+            except ServiceError as e:
+                if getattr(e, "status", None) == 404:
+                    return True
+                logging.warning(f"Error checking HeatWave cluster state: {e}")
+                await asyncio.sleep(poll_interval)
+            except Exception as e:
+                logging.warning(f"Error checking HeatWave cluster state: {e}")
+                await asyncio.sleep(poll_interval)
+
+        logging.warning("Timeout waiting for HeatWave cluster deletion")
         return False

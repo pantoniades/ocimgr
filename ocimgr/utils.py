@@ -508,7 +508,8 @@ async def run_with_backoff(
     max_retries: int = 6,
     base_delay: float = 0.75,
     max_delay: float = 12.0,
-    jitter: float = 0.2
+    jitter: float = 0.2,
+    on_retry: Optional[Callable[[Exception, float, int], None]] = None
 ) -> T:
     """
     Run an async operation with exponential backoff for OCI throttling.
@@ -532,6 +533,8 @@ async def run_with_backoff(
 
             delay = min(max_delay, base_delay * (2 ** attempt))
             delay = delay * (1 + random.uniform(-jitter, jitter))
+            if on_retry:
+                on_retry(exc, delay, attempt)
             await asyncio.sleep(delay)
             attempt += 1
 
