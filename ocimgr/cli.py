@@ -314,6 +314,7 @@ class OCIMgrAsyncCLI:
         """
         resource_map = {
             "compute_instance": ("compute", "list_instances"),
+            "instance_pool": ("compute_management", "list_instance_pools"),
             "autonomous_database": ("database", "list_autonomous_databases"),
             "mysql_db_system": ("mysql", "list_db_systems"),
             "oke_cluster": ("container_engine", "list_clusters")
@@ -480,6 +481,8 @@ class OCIMgrAsyncCLI:
             match resource.info.resource_type:
                 case "compute_instance":
                     icon = "🖥️"
+                case "instance_pool":
+                    icon = "🧰"
                 case "autonomous_database" | "mysql_db_system":
                     icon = "🗄️"
                 case "oke_cluster":
@@ -674,6 +677,7 @@ class OCIMgrAsyncCLI:
             try:
                 client_map = {
                     "compute_instance": ("compute", "get_instance", "instance_id"),
+                    "instance_pool": ("compute_management", "get_instance_pool", "instance_pool_id"),
                     "autonomous_database": ("database", "get_autonomous_database", "autonomous_database_id"),
                     "mysql_db_system": ("mysql", "get_db_system", "db_system_id"),
                     "oke_cluster": ("container_engine", "get_cluster", "cluster_id")
@@ -1039,6 +1043,8 @@ async def _handle_list_resources(cli_app: OCIMgrAsyncCLI) -> None:
         match resource_type:
             case "compute_instance":
                 icon = "🖥️"
+            case "instance_pool":
+                icon = "🧰"
             case "autonomous_database" | "mysql_db_system":
                 icon = "🗄️"
             case "oke_cluster":
@@ -1631,6 +1637,8 @@ async def resources_command(ctx, compartment_numbers, format, output, types, ski
                     match resource_type:
                         case "compute_instance":
                             icon = "🖥️"
+                        case "instance_pool":
+                            icon = "🧰"
                         case "autonomous_database" | "mysql_db_system":
                             icon = "🗄️"
                         case "oke_cluster":

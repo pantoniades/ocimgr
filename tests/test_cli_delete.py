@@ -23,6 +23,48 @@ class DummyCLI(OCIMgrAsyncCLI):
         ]
 
 
+class DummyResource:
+    def __init__(self, resource_type: str, compartment_id: str):
+        self.info = type(
+            "Info",
+            (),
+            {
+                "resource_type": resource_type,
+                "ocid": f"ocid1.{resource_type}.oc1..aaaa",
+                "region": "us-ashburn-1",
+                "name": f"{resource_type}-resource",
+                "compartment_id": compartment_id,
+                "lifecycle_state": "RUNNING",
+                "has_delete_protection": False,
+            },
+        )()
+
+    def get_estimated_deletion_time(self):
+        return 10
+
+    def get_deletion_order_priority(self):
+        return 1
+
+
+class DummyDeletionCLI(DummyCLI):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.session = type("Session", (), {"get_all_regions": lambda self: ["us-ashburn-1"]})()
+
+    async def discover_resources(self, compartment_ids, resource_type_filter=None, skip_unauthorized=True):
+        return {
+            compartment_ids[0]: [
+                DummyResource("instance_pool", compartment_ids[0]),
+            ]
+        }
+
+    async def create_deletion_plan(self, resources, balance_by_region: bool = False):
+        return resources
+
+    async def execute_deletion(self, resources, *args, **kwargs):
+        return {"total": len(resources), "successful": len(resources), "failed": 0, "results": []}
+
+
 def test_delete_compartment_confirm_step(monkeypatch, tmp_path):
     # monkeypatch CLI class used in command
     monkeypatch.setattr('ocimgr.cli.OCIMgrAsyncCLI', DummyCLI)
@@ -45,6 +87,37 @@ def test_delete_compartment_confirm_step(monkeypatch, tmp_path):
         obj={'config': None, 'profile': 'DEFAULT', 'log_level': 'INFO'}
     )
     assert result.exit_code == 0
+
+
+def test_delete_compartment_refreshes_instance_pool_state(monkeypatch):
+    monkeypatch.setattr('ocimgr.cli.OCIMgrAsyncCLI', DummyDeletionCLI)
+
+    async def dummy_refresh(cli_app, regions, verbose, label):
+        return
+
+    async def dummy_cache(cli_app, cache_path, verbose):
+        return []
+
+    monkeypatch.setattr('ocimgr.cli.refresh_session_regions', dummy_refresh)
+    monkeypatch.setattr('ocimgr.cli.discover_and_cache_regions', dummy_cache)
+
+    class DummyCompartmentManager:
+        async def delete_compartment(self, compartment_id: str, region: str = None):
+            return True
+
+    monkeypatch.setattr('ocimgr.cli.CompartmentManager', DummyCompartmentManager)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        delete_compartment_command,
+        ['ocid1.compartment.oc1..aaaa', '--dry-run', '--skip-unauthorized'],
+        input='y\n',
+        catch_exceptions=False,
+        obj={'config': None, 'profile': 'DEFAULT', 'log_level': 'INFO'}
+    )
+
+    assert result.exit_code == 0
+    assert "instance_pool" in result.output
 
 
 # additional test using the real delete-compartments file if it exists

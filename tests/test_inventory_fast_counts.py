@@ -17,6 +17,9 @@ class DummyClient:
     def list_instances(self, compartment_id=None):
         pass
 
+    def list_instance_pools(self, compartment_id=None):
+        pass
+
     def list_autonomous_databases(self, compartment_id=None):
         pass
 
@@ -103,6 +106,40 @@ async def test_discover_fast_counts_timeout_returns_zero(monkeypatch):
     payload = result["compartment-a"]["compute_instance"]
     assert payload["count"] == 2
     assert payload["regions"] == ["us-phoenix-1"]
+
+
+@pytest.mark.asyncio
+async def test_discover_fast_counts_instance_pools(monkeypatch):
+    counts_by_region = {
+        "us-ashburn-1": 4,
+        "us-phoenix-1": 0,
+    }
+    calls = []
+
+    async def fake_run(operation, *args, **kwargs):
+        assert operation is oci.pagination.list_call_get_all_results
+        method = args[0]
+        calls.append(method.__name__)
+        region = method.__self__.region
+        count = counts_by_region.get(region, 0)
+        return SimpleNamespace(data=list(range(count)))
+
+    monkeypatch.setattr(core.AsyncResourceMixin, "_run_oci_operation", fake_run)
+
+    cli = OCIMgrAsyncCLI()
+    cli.session = DummySession(list(counts_by_region.keys()))
+
+    result = await cli.discover_fast_counts(
+        ["compartment-a"],
+        resource_type_filter=["instance_pool"],
+        max_concurrent=2,
+        request_timeout=1.0,
+    )
+
+    payload = result["compartment-a"]["instance_pool"]
+    assert payload["count"] == 4
+    assert payload["regions"] == ["us-ashburn-1"]
+    assert all(name == "list_instance_pools" for name in calls)
 
 
 @pytest.mark.asyncio

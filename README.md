@@ -101,6 +101,12 @@ slow regions return sooner and logging continues.
 ocimgr compartments
 ```
 
+### Export full compartment list
+```bash
+ocimgr compartments --format csv --output compartments.csv
+ocimgr compartments --format json --output compartments.json
+```
+
 If you see identity timeouts while listing compartments, ensure your OCI config
 `region` is set to your tenancy’s home region. OCIMgr now uses the configured
 home region for identity calls and retries transient failures automatically.
@@ -108,6 +114,11 @@ home region for identity calls and retries transient failures automatically.
 ### High-level inventory (counts only, hides zero rows)
 ```bash
 ocimgr inventory
+```
+
+### Inventory only specific resource types (including instance pools)
+```bash
+ocimgr inventory --types compute_instance,instance_pool,mysql_db_system
 ```
 
 OCIMgr stores a `.region_cache` JSON file next to your OCI config. If it is missing,
@@ -146,9 +157,19 @@ ocimgr inventory --list-empty
 ocimgr inventory --format csv --output inventory.csv
 ```
 
+### Full compartment inventory (include zeros + save CSV)
+```bash
+ocimgr inventory --list-empty --format csv --output full-inventory.csv
+```
+
 ### Delete a compartment (with dry-run)
 ```bash
 ocimgr delete-compartment "Finance" --dry-run
+```
+
+### Delete multiple compartments from a targets file
+```bash
+ocimgr delete-compartment --targets-file ./delete-compartments-0307.txt --dry-run
 ```
 
 ### Add a delay before compartment deletion pass
@@ -171,6 +192,11 @@ ocimgr delete-compartment "Finance" --no-skip-unauthorized
 ### Delete a compartment by OCID (with confirmation)
 ```bash
 ocimgr delete-compartment ocid1.compartment.oc1..xxxx
+```
+
+### Delete a compartment while skipping delete-protected resources
+```bash
+ocimgr delete-compartment "Finance" --skip-protected
 ```
 
 ## Throttling Guidance
@@ -204,6 +230,7 @@ The CLI includes exponential backoff for 429 responses.
 
 ## Current Resource Types (Limited Scope)
 - Compute Instances
+- Instance Pools
 - Autonomous Databases
 - MySQL DB Systems
 - OKE Clusters

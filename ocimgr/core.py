@@ -354,6 +354,7 @@ class AsyncOCISession:
         }
         self._clients[region] = {
             'compute': oci.core.ComputeClient(region_config, **client_kwargs),
+            'compute_management': oci.core.ComputeManagementClient(region_config, **client_kwargs),
             'database': oci.database.DatabaseClient(region_config, **client_kwargs),
             'mysql': oci.mysql.DbSystemClient(region_config, **client_kwargs),
             'container_engine': oci.container_engine.ContainerEngineClient(region_config, **client_kwargs),

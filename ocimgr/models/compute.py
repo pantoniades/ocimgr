@@ -15,7 +15,7 @@ from ocimgr.core import (
     AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder, 
     register_resource_type, AsyncOCISession, OperationResult, ResourceStatus
 )
-from ocimgr.utils import run_with_backoff
+from ocimgr.utils import run_with_backoff, is_transient_network_error
 
 
 @register_resource_type
@@ -100,6 +100,14 @@ class ComputeInstance(AbstractOCIResource, AsyncResourceMixin):
                         return []
                 logging.error(f"Error discovering compute instances in {region}: {e}")
             except Exception as e:
+                if skip_unauthorized and is_transient_network_error(e):
+                    session.mark_region_unauthorized(region)
+                    logging.warning(
+                        "Skipping region %s due to transient network error: %s",
+                        region,
+                        e
+                    )
+                    return []
                 logging.error(f"Unexpected error discovering compute instances in {region}: {e}")
         
             return instances
@@ -306,7 +314,8 @@ class ComputeInstance(AbstractOCIResource, AsyncResourceMixin):
             await self._run_oci_operation(
                 compute_client.terminate_instance,
                 instance_id=self.info.ocid,
-                preserve_boot_volume=False  # Delete boot volume as well
+                preserve_boot_volume=False,  # Delete boot volume as well
+                preserve_data_volumes_created_at_launch=False
             )
             
             logging.info(f"Successfully initiated termination of instance {self.info.name}")
@@ -336,6 +345,165 @@ class ComputeInstance(AbstractOCIResource, AsyncResourceMixin):
             error_msg = f"Unexpected error during deletion: {e}"
             logging.error(f"Unexpected error deleting compute instance {self.info.name}: {error_msg}")
             
+            return OperationResult(
+                resource_ocid=self.info.ocid,
+                operation="delete",
+                status=ResourceStatus.FAILED,
+                message=error_msg,
+                duration=time.time() - start_time,
+                error_details={'exception': str(e)}
+            )
+
+
+@register_resource_type
+class InstancePool(AbstractOCIResource, AsyncResourceMixin):
+    """OCI Compute Instance Pool resource with async operations"""
+
+    resource_type = "instance_pool"
+    deletion_order = DeletionOrder.COMPUTE
+
+    @classmethod
+    async def discover(
+        cls,
+        session: AsyncOCISession,
+        compartment_id: str,
+        skip_unauthorized: bool = False
+    ) -> List['InstancePool']:
+        """Discover all instance pools across all regions concurrently."""
+
+        async def discover_in_region(region: str) -> List['InstancePool']:
+            pools: List[InstancePool] = []
+            try:
+                compute_mgmt_client = await session.get_client('compute_management', region)
+
+                async def list_operation():
+                    return await cls._run_oci_operation(
+                        compute_mgmt_client.list_instance_pools,
+                        compartment_id=compartment_id
+                    )
+
+                list_response = await run_with_backoff(list_operation)
+
+                for pool in list_response.data:
+                    if pool.lifecycle_state in ['DELETED', 'DELETING']:
+                        continue
+
+                    estimated_time = 180
+                    match pool.lifecycle_state:
+                        case 'RUNNING' | 'SCALING' | 'UPDATING':
+                            estimated_time = 300
+                        case _:
+                            estimated_time = 180
+
+                    metadata = {
+                        'size': getattr(pool, 'size', None),
+                        'instance_configuration_id': getattr(pool, 'instance_configuration_id', None)
+                    }
+
+                    resource_info = ResourceInfo(
+                        ocid=pool.id,
+                        name=pool.display_name,
+                        compartment_id=compartment_id,
+                        region=region,
+                        resource_type=cls.resource_type,
+                        lifecycle_state=pool.lifecycle_state,
+                        estimated_deletion_time=estimated_time,
+                        deletion_order=cls.deletion_order.value,
+                        has_delete_protection=False,
+                        dependencies=[],
+                        metadata=metadata
+                    )
+                    pools.append(cls(resource_info))
+            except ServiceError as e:
+                if e.status in {401, 403}:
+                    session.mark_region_unauthorized(region)
+                    if skip_unauthorized:
+                        logging.debug(f"Skipping unauthorized instance pool discovery in {region}: {e}")
+                        return []
+                logging.error(f"Error discovering instance pools in {region}: {e}")
+            except Exception as e:
+                if skip_unauthorized and is_transient_network_error(e):
+                    session.mark_region_unauthorized(region)
+                    logging.warning(
+                        "Skipping region %s due to transient network error: %s",
+                        region,
+                        e
+                    )
+                    return []
+                logging.error(f"Unexpected error discovering instance pools in {region}: {e}")
+
+            return pools
+
+        max_concurrent = getattr(session, "max_concurrent_regions", 5)
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        async def guarded_discover(region: str) -> List['InstancePool']:
+            async with semaphore:
+                return await discover_in_region(region)
+
+        region_tasks = [
+            guarded_discover(region)
+            for region in session.get_authorized_regions()
+        ]
+
+        region_results = await asyncio.gather(*region_tasks, return_exceptions=True)
+        all_pools: List[InstancePool] = []
+        for result in region_results:
+            if isinstance(result, list):
+                all_pools.extend(result)
+            elif isinstance(result, Exception):
+                logging.error(f"Region discovery failed: {result}")
+
+        logging.info(f"Discovered {len(all_pools)} instance pools in compartment {compartment_id}")
+        return all_pools
+
+    async def disable_delete_protection(self) -> OperationResult:
+        """Instance pools do not have delete protection."""
+        return OperationResult(
+            resource_ocid=self.info.ocid,
+            operation="disable_protection",
+            status=ResourceStatus.COMPLETED,
+            message="No delete protection enabled",
+            duration=0.0
+        )
+
+    async def delete(self) -> OperationResult:
+        """Delete the instance pool."""
+        start_time = time.time()
+        try:
+            compute_mgmt_client = await self._session.get_client(
+                'compute_management',
+                self.info.region
+            )
+
+            logging.info(f"Deleting instance pool {self.info.name}")
+            await self._run_oci_operation(
+                compute_mgmt_client.terminate_instance_pool,
+                instance_pool_id=self.info.ocid
+            )
+
+            logging.info(f"Successfully initiated deletion of instance pool {self.info.name}")
+            return OperationResult(
+                resource_ocid=self.info.ocid,
+                operation="delete",
+                status=ResourceStatus.COMPLETED,
+                message="Instance pool deletion initiated successfully",
+                duration=time.time() - start_time
+            )
+        except ServiceError as e:
+            error_msg = f"OCI API error during deletion: {e}"
+            logging.error(f"Error deleting instance pool {self.info.name}: {error_msg}")
+            return OperationResult(
+                resource_ocid=self.info.ocid,
+                operation="delete",
+                status=ResourceStatus.FAILED,
+                message=error_msg,
+                duration=time.time() - start_time,
+                error_details={'oci_error': str(e)}
+            )
+        except Exception as e:
+            error_msg = f"Unexpected error during deletion: {e}"
+            logging.error(f"Unexpected error deleting instance pool {self.info.name}: {error_msg}")
             return OperationResult(
                 resource_ocid=self.info.ocid,
                 operation="delete",
