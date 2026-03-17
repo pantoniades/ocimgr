@@ -11,7 +11,7 @@ import oci
 from oci.exceptions import ServiceError
 
 from ..core import AsyncResourceMixin, AsyncOCISession, get_registered_resource_types
-from ..utils import run_with_backoff
+from ..utils import run_with_backoff, get_oci_request_id
 
 
 class CompartmentManager:
@@ -232,7 +232,7 @@ class CompartmentManager:
         self,
         compartment_id: str,
         region: Optional[str] = None,
-        timeout_seconds: int = 600
+        timeout_seconds: int = 120
     ) -> bool:
         """
         Delete a compartment (must be empty first) with timeout.
@@ -240,13 +240,20 @@ class CompartmentManager:
         Args:
             compartment_id: Compartment ID to delete
             region: Region for deletion (defaults to home region)
-            timeout_seconds: Max time to wait for deletion (default 600s to allow slow operations)
+            timeout_seconds: Max time to wait for deletion (default 120s for retry-based deletes)
 
         Returns:
             True if deletion initiated, False otherwise
         """
         try:
             identity_client = await self.session.get_client('identity', region)
+
+            logging.info(
+                "event=compartment_delete_attempt compartment_id=%s region=%s timeout=%s",
+                compartment_id,
+                region or self.session.oci_config.get('region'),
+                timeout_seconds
+            )
 
             details_response = await AsyncResourceMixin._run_oci_operation(
                 identity_client.get_compartment,
@@ -278,9 +285,10 @@ class CompartmentManager:
                     run_with_backoff(
                         delete_operation,
                         max_retries=12,
-                        base_delay=5.0,
-                        max_delay=300.0,
-                        jitter=0.3
+                        base_delay=4.0,
+                        max_delay=120.0,
+                        jitter=0.3,
+                        retry_log_label="compartment_delete"
                     ),
                     timeout=timeout_seconds
                 )
@@ -294,13 +302,20 @@ class CompartmentManager:
             return True
 
         except ServiceError as e:
+            request_id = get_oci_request_id(e)
             if e.status == 404:
                 logging.warning(f"Compartment {compartment_id} not found")
                 return False
             if e.status == 429 or e.status >= 500:
                 # Treat throttling and server errors as transient
                 raise
-            logging.error(f"Error deleting compartment {compartment_id}: {e}")
+            logging.error(
+                "Error deleting compartment %s (status=%s, request_id=%s): %s",
+                compartment_id,
+                e.status,
+                request_id or "n/a",
+                e
+            )
             return False
         except Exception as e:
             # For transient network issues or throttling the inner backoff

@@ -1968,8 +1968,8 @@ async def inventory_command(
 @click.option('--compartment-concurrency', type=int, default=2,
               help='Max concurrent target compartments to process')
 @click.option('--delete-retry-max', type=int, default=6, help='Max delete retries when throttled')
-@click.option('--delete-retry-base-delay', type=float, default=0.75, help='Base delay (seconds) for delete backoff')
-@click.option('--delete-retry-max-delay', type=float, default=12.0, help='Max delay (seconds) for delete backoff')
+@click.option('--delete-retry-base-delay', type=float, default=1.5, help='Base delay (seconds) for delete backoff')
+@click.option('--delete-retry-max-delay', type=float, default=30.0, help='Max delay (seconds) for delete backoff')
 @click.option('--compartment-delay', type=float, default=0.0, help='Delay (seconds) between compartment deletes')
 @click.option('--target-delay', type=float, default=0.0, help='Delay (seconds) between target compartments')
 @click.option('--retry-pass-delay', type=float, default=120.0,
@@ -1978,6 +1978,13 @@ async def inventory_command(
               help='Number of compartment delete passes to attempt')
 @click.option('--verify-cleanup/--no-verify-cleanup', default=True,
               help='Re-discover resources before deleting compartments (default: on)')
+@click.option('--no-discovery', is_flag=True,
+              help='Skip resource discovery and attempt compartment deletion directly')
+@click.option('--auto-discovery/--no-auto-discovery', default=True,
+              help='Auto-skip full discovery when fast counts find zero resources (default: on)')
+@click.option('--delete-timeout', type=int, default=120,
+              help='Timeout (seconds) for compartment delete API calls')
+@click.option('--regions', help='Comma-separated list of regions to limit discovery')
 @click.option('--discover-regions', is_flag=True, help='Rebuild cached regions from OCI')
 @click.option('--skip-unauthorized/--no-skip-unauthorized', default=True,
               help='Skip 401/403 unauthorized regions (default: on)')
@@ -2002,6 +2009,10 @@ async def delete_compartment_command(
     retry_pass_delay,
     compartment_delete_passes,
     verify_cleanup,
+    no_discovery,
+    auto_discovery,
+    delete_timeout,
+    regions,
     discover_regions,
     skip_unauthorized,
     verbose
@@ -2066,6 +2077,12 @@ async def delete_compartment_command(
                 await refresh_session_regions(cli_app, subscribed_regions, verbose, "subscribed")
             elif verbose:
                 click.echo("⚠️ No subscribed regions returned; using config default")
+
+        if regions:
+            requested_regions = [r.strip() for r in regions.split(',') if r.strip()]
+            if requested_regions:
+                click.echo(f"🎯 Limiting discovery to regions: {', '.join(requested_regions)}")
+                await refresh_session_regions(cli_app, requested_regions, verbose, "requested")
 
         all_compartments = await cli_app.list_compartments()
         if not all_compartments:
@@ -2254,6 +2271,68 @@ async def delete_compartment_command(
                 )
 
                 compartment_ids = [comp['id'] for comp in scoped_compartments]
+
+                if no_discovery:
+                    click.echo("⚡ No-discovery mode enabled; skipping resource scan.")
+                    if dry_run:
+                        click.echo("🧪 Dry run mode enabled - skipping compartment deletes.")
+                        if target_delay > 0:
+                            await asyncio.sleep(target_delay)
+                        async with state_lock:
+                            remaining_targets.append(target)
+                        return
+
+                    async with state_lock:
+                        pending_deletions.append({
+                            "target": target,
+                            "qualified_path": get_qualified_path(target_compartment['id']),
+                            "target_compartment": target_compartment,
+                            "scoped_compartments": scoped_compartments
+                        })
+                    if target_delay > 0:
+                        await asyncio.sleep(target_delay)
+                    return
+
+                if auto_discovery:
+                    click.echo("⚡ Auto-discovery enabled; running fast counts first...")
+                    fast_counts = await cli_app.discover_fast_counts(
+                        [comp['id'] for comp in scoped_compartments],
+                        max_concurrent=max(1, max_concurrent),
+                        verbose=verbose,
+                        skip_unauthorized=skip_unauthorized,
+                        request_timeout=45.0
+                    )
+                    remaining_fast = 0
+                    for payload in fast_counts.values():
+                        for metrics in payload.values():
+                            remaining_fast += metrics.get("count", 0)
+
+                    if remaining_fast == 0:
+                        click.echo(
+                            "✅ Fast counts show zero resources; skipping full discovery and queueing for delete."
+                        )
+                        logging.info(
+                            "auto_discovery_fast_counts=0 for %s",
+                            get_qualified_path(target_compartment['id'])
+                        )
+                        if dry_run:
+                            click.echo("🧪 Dry run mode enabled - skipping compartment deletes.")
+                            if target_delay > 0:
+                                await asyncio.sleep(target_delay)
+                            async with state_lock:
+                                remaining_targets.append(target)
+                            return
+
+                        async with state_lock:
+                            pending_deletions.append({
+                                "target": target,
+                                "qualified_path": get_qualified_path(target_compartment['id']),
+                                "target_compartment": target_compartment,
+                                "scoped_compartments": scoped_compartments
+                            })
+                        if target_delay > 0:
+                            await asyncio.sleep(target_delay)
+                        return
 
                 click.echo("🔍 Discovering resources for deletion plan...")
 
@@ -2521,40 +2600,58 @@ async def delete_compartment_command(
                         click.echo(
                             f"🔁 Verifying cleanup for {entry['qualified_path']} before delete pass..."
                         )
-                        resources_after_cleanup = await cli_app.discover_resources(
+                        fast_counts = await cli_app.discover_fast_counts(
                             [comp['id'] for comp in scoped_compartments],
-                            skip_unauthorized=skip_unauthorized
+                            max_concurrent=max(1, max_concurrent),
+                            verbose=verbose,
+                            skip_unauthorized=skip_unauthorized,
+                            request_timeout=45.0
                         )
-                        remaining_resources = [
-                            res
-                            for res_list in resources_after_cleanup.values()
-                            for res in res_list
-                        ]
-                        if remaining_resources:
-                            click.echo(
-                                f"⚠️  {len(remaining_resources)} resources still present; deferring compartment delete."
+                        remaining_fast = 0
+                        for payload in fast_counts.values():
+                            for metrics in payload.values():
+                                remaining_fast += metrics.get("count", 0)
+
+                        if remaining_fast == 0:
+                            logging.info(
+                                "verify_cleanup_fast_counts=0 for %s",
+                                entry["qualified_path"]
                             )
-                            remaining_summary = []
-                            for resource in remaining_resources:
-                                remaining_summary.append({
-                                    "resource_type": resource.info.resource_type,
-                                    "name": resource.info.name,
-                                    "region": resource.info.region,
-                                    "ocid": resource.info.ocid,
-                                    "compartment_path": get_qualified_path(resource.info.compartment_id)
-                                    or resource.info.compartment_id
-                                })
-                            click.echo("  Remaining resources (sorted by compartment/region):")
-                            for resource_entry in sorted(
-                                remaining_summary,
-                                key=lambda r: (r.get("compartment_path", ""), r.get("region", ""), r.get("name", ""))
-                            ):
+                        else:
+                            resources_after_cleanup = await cli_app.discover_resources(
+                                [comp['id'] for comp in scoped_compartments],
+                                skip_unauthorized=skip_unauthorized
+                            )
+                            remaining_resources = [
+                                res
+                                for res_list in resources_after_cleanup.values()
+                                for res in res_list
+                            ]
+                            if remaining_resources:
                                 click.echo(
-                                    "    - {resource_type}: {name} | {region} | {compartment_path} | {ocid}".format(**resource_entry)
+                                    f"⚠️  {len(remaining_resources)} resources still present; deferring compartment delete."
                                 )
-                            delete_success = False
-                            next_pending_deletions.append(entry)
-                            continue
+                                remaining_summary = []
+                                for resource in remaining_resources:
+                                    remaining_summary.append({
+                                        "resource_type": resource.info.resource_type,
+                                        "name": resource.info.name,
+                                        "region": resource.info.region,
+                                        "ocid": resource.info.ocid,
+                                        "compartment_path": get_qualified_path(resource.info.compartment_id)
+                                        or resource.info.compartment_id
+                                    })
+                                click.echo("  Remaining resources (sorted by compartment/region):")
+                                for resource_entry in sorted(
+                                    remaining_summary,
+                                    key=lambda r: (r.get("compartment_path", ""), r.get("region", ""), r.get("name", ""))
+                                ):
+                                    click.echo(
+                                        "    - {resource_type}: {name} | {region} | {compartment_path} | {ocid}".format(**resource_entry)
+                                    )
+                                delete_success = False
+                                next_pending_deletions.append(entry)
+                                continue
 
                     click.echo(
                         f"🎯 Deleting compartment tree for {entry['qualified_path']} "
@@ -2589,7 +2686,8 @@ async def delete_compartment_command(
                             async def delete_operation() -> bool:
                                 return await cli_app.compartment_manager.delete_compartment(
                                     comp['id'],
-                                    region=delete_region
+                                    region=delete_region,
+                                    timeout_seconds=delete_timeout
                                 )
 
                             try:
@@ -2597,7 +2695,8 @@ async def delete_compartment_command(
                                     delete_operation,
                                     max_retries=delete_retry_max,
                                     base_delay=delete_retry_base_delay,
-                                    max_delay=delete_retry_max_delay
+                                    max_delay=delete_retry_max_delay,
+                                    retry_log_label="compartment_delete"
                                 )
                             except Exception as e:
                                 success = False

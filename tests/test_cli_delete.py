@@ -49,7 +49,17 @@ class DummyResource:
 class DummyDeletionCLI(DummyCLI):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.session = type("Session", (), {"get_all_regions": lambda self: ["us-ashburn-1"]})()
+        class DummySession:
+            def get_all_regions(self):
+                return ["us-ashburn-1"]
+
+            def get_current_region(self):
+                return "us-ashburn-1"
+
+            async def close(self):
+                return
+
+        self.session = DummySession()
 
     async def discover_resources(self, compartment_ids, resource_type_filter=None, skip_unauthorized=True):
         return {
@@ -57,9 +67,6 @@ class DummyDeletionCLI(DummyCLI):
                 DummyResource("instance_pool", compartment_ids[0]),
             ]
         }
-
-    async def create_deletion_plan(self, resources, balance_by_region: bool = False):
-        return resources
 
     async def execute_deletion(self, resources, *args, **kwargs):
         return {"total": len(resources), "successful": len(resources), "failed": 0, "results": []}
@@ -102,7 +109,12 @@ def test_delete_compartment_refreshes_instance_pool_state(monkeypatch):
     monkeypatch.setattr('ocimgr.cli.discover_and_cache_regions', dummy_cache)
 
     class DummyCompartmentManager:
-        async def delete_compartment(self, compartment_id: str, region: str = None):
+        async def delete_compartment(
+            self,
+            compartment_id: str,
+            region: str = None,
+            timeout_seconds: int = 120
+        ):
             return True
 
     monkeypatch.setattr('ocimgr.cli.CompartmentManager', DummyCompartmentManager)

@@ -9,6 +9,7 @@ import json
 import csv
 import random
 import asyncio
+import logging
 from typing import List, Dict, Any, Optional, TextIO, Callable, TypeVar
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
@@ -502,6 +503,26 @@ def is_transient_network_error(error: Exception) -> bool:
     return False
 
 
+def is_dns_error(error: Exception) -> bool:
+    """Return True for DNS resolution failures."""
+    if isinstance(error, socket.gaierror):
+        return True
+    if isinstance(error, oci.exceptions.RequestException):
+        message = " ".join(str(arg) for arg in error.args)
+        if "nodename nor servname provided" in message or "Name or service not known" in message:
+            return True
+    return False
+
+
+def get_oci_request_id(error: Exception) -> Optional[str]:
+    """Extract opc-request-id from OCI ServiceError if available."""
+    if isinstance(error, oci.exceptions.ServiceError):
+        request_id = getattr(error, "request_id", None)
+        if request_id:
+            return request_id
+    return None
+
+
 async def run_with_backoff(
     operation: Callable[[], T],
     *,
@@ -509,7 +530,8 @@ async def run_with_backoff(
     base_delay: float = 0.75,
     max_delay: float = 12.0,
     jitter: float = 0.2,
-    on_retry: Optional[Callable[[Exception, float, int], None]] = None
+    on_retry: Optional[Callable[[Exception, float, int], None]] = None,
+    retry_log_label: Optional[str] = None
 ) -> T:
     """
     Run an async operation with exponential backoff for OCI throttling.
@@ -533,6 +555,23 @@ async def run_with_backoff(
 
             delay = min(max_delay, base_delay * (2 ** attempt))
             delay = delay * (1 + random.uniform(-jitter, jitter))
+            if is_throttle_error(exc):
+                delay = max(delay, base_delay * 4)
+            elif is_dns_error(exc):
+                delay = max(delay, base_delay * 2)
+            else:
+                delay = max(delay, base_delay)
+
+            request_id = get_oci_request_id(exc)
+            if retry_log_label:
+                logging.info(
+                    "%s retry %s (delay=%.2fs, error=%s, request_id=%s)",
+                    retry_log_label,
+                    attempt + 1,
+                    delay,
+                    exc.__class__.__name__,
+                    request_id or "n/a"
+                )
             if on_retry:
                 on_retry(exc, delay, attempt)
             await asyncio.sleep(delay)

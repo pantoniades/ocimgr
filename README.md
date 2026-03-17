@@ -172,15 +172,35 @@ ocimgr delete-compartment "Finance" --dry-run
 ocimgr delete-compartment --targets-file ./delete-compartments-0307.txt --dry-run
 ```
 
+### Delete a compartment without resource discovery (fast delete-only)
+```bash
+ocimgr delete-compartment "Finance" --no-discovery
+```
+
+### Auto-skip deep discovery when fast counts are zero (default on)
+```bash
+ocimgr delete-compartment "Finance" --auto-discovery
+```
+
 ### Add a delay before compartment deletion pass
 ```bash
 ocimgr delete-compartment "Finance" --retry-pass-delay 300
+```
+
+### Tune delete timeout and retries
+```bash
+ocimgr delete-compartment "Finance" --delete-timeout 180 --delete-retry-max 8
 ```
 
 ### Control compartment delete passes and cleanup verification
 ```bash
 ocimgr delete-compartment "Finance" --compartment-delete-passes 3
 ocimgr delete-compartment "Finance" --no-verify-cleanup
+```
+
+### Limit discovery to specific regions
+```bash
+ocimgr delete-compartment "Finance" --regions us-ashburn-1,us-phoenix-1
 ```
 
 ### Delete a compartment while skipping unauthorized regions
@@ -212,15 +232,23 @@ OCI will throttle list calls under heavy concurrency. Use:
 - Compartments are deleted **leaf-to-root** after resources are removed.
 - A second pass (or more) deletes compartments after a configurable wait (`--retry-pass-delay`) to
   allow asynchronous cleanup to settle. Use `--compartment-delete-passes` to attempt more passes.
-- Cleanup verification re-discovers remaining resources before deletion; disable with `--no-verify-cleanup`.
+- Cleanup verification now uses a **fast counts-only** scan first, and only performs full discovery
+  if counts are non-zero. Disable verification with `--no-verify-cleanup`.
+- Use `--no-discovery` to skip resource scanning when you know the compartment is empty.
+- Auto-discovery uses fast counts up front and skips full discovery when counts are zero (toggle with
+  `--no-auto-discovery`).
 
 ## How `delete-compartment` Works
 1. **Resolve target** by OCID or name (name searches and includes subtree).
-2. **Discover resources** across the target compartment and descendants.
+2. **Discover resources** across the target compartment and descendants (skipped with `--no-discovery`; auto-skipped when
+   fast counts are zero).
 3. **Build deletion plan** ordered by dependency (`DeletionOrder`) and balanced round-robin by region.
 4. **Disable delete protection** where supported before deletion.
 5. **Delete resources**, queue compartments for deletion, verify cleanup, then delete compartments
    **leaf-to-root** with configurable passes (`--retry-pass-delay`, `--compartment-delete-passes`).
+
+Cleanup verification uses fast counts first; only if counts are non-zero does it fall back to a
+full discovery pass.
 
 Use `--dry-run` to validate the plan without making changes.
 
