@@ -236,6 +236,14 @@ class OCIConfig:
         "~/.oci_mgr/config", 
         "./oci_mgr.ini"
     ]
+
+    REQUIRED_KEYS = (
+        "user",
+        "fingerprint",
+        "key_file",
+        "tenancy",
+        "region"
+    )
     
     def __init__(self, config_path: Optional[str] = None, profile: str = "DEFAULT"):
         self.config_path = self._resolve_config_path(config_path)
@@ -249,7 +257,11 @@ class OCIConfig:
         if config_path:
             path = Path(config_path).expanduser()
             if not path.exists():
-                raise FileNotFoundError(f"Config file not found: {config_path}")
+                raise FileNotFoundError(
+                    f"Config file not found: {config_path}. "
+                    "Provide a valid path via --config or place a file in one of the default locations: "
+                    f"{', '.join(self.DEFAULT_CONFIG_PATHS)}"
+                )
             return str(path)
         
         # Try default locations
@@ -258,22 +270,63 @@ class OCIConfig:
             if path.exists():
                 return str(path)
         
-        raise FileNotFoundError(f"No config file found in default locations: {self.DEFAULT_CONFIG_PATHS}")
+        raise FileNotFoundError(
+            "No OCI config file found. Looked in default locations: "
+            f"{', '.join(self.DEFAULT_CONFIG_PATHS)}. "
+            "Create a config file or pass --config to point to it."
+        )
+
+    def _validate_config(self, config_parser: configparser.ConfigParser) -> None:
+        """Validate required config keys and referenced files."""
+        section = config_parser[self.profile]
+        missing_keys = [key for key in self.REQUIRED_KEYS if not section.get(key)]
+
+        if missing_keys:
+            missing_list = ", ".join(missing_keys)
+            raise ValueError(
+                f"OCI config profile '{self.profile}' is missing required keys: {missing_list}. "
+                "Ensure your config includes user, fingerprint, key_file, tenancy, and region."
+            )
+
+        key_file = Path(section.get("key_file", "")).expanduser()
+        if not key_file.exists():
+            raise FileNotFoundError(
+                f"OCI API key file not found: {key_file}. "
+                "Update the key_file path in your OCI config or generate a new key."
+            )
     
     def _load_config(self) -> None:
         """Load OCI configuration"""
         try:
+            config_parser = configparser.ConfigParser()
+            read_files = config_parser.read(self.config_path)
+            if not read_files:
+                raise FileNotFoundError(
+                    f"OCI config file could not be read: {self.config_path}. "
+                    "Check file permissions and path."
+                )
+
+            has_default = self.profile.upper() == "DEFAULT"
+            if not config_parser.has_section(self.profile) and not has_default:
+                available_sections = ", ".join(config_parser.sections()) or "(none)"
+                available_default = "DEFAULT" if config_parser.defaults() else None
+                available = ", ".join(
+                    s for s in [available_default, available_sections] if s and s != "(none)"
+                ) or "(none)"
+                raise ValueError(
+                    f"OCI config profile '{self.profile}' not found in {self.config_path}. "
+                    f"Available profiles: {available}."
+                )
+
+            self._validate_config(config_parser)
+
             # Use OCI SDK's config loader for standard OCI config format
             self._config = from_file(self.config_path, self.profile)
-            
-            # Load regions configuration
-            config_parser = configparser.ConfigParser()
-            config_parser.read(self.config_path)
             
             # Get regions from config or use default
             if config_parser.has_option(self.profile, 'regions'):
                 regions_str = config_parser.get(self.profile, 'regions')
-                self._regions = [r.strip() for r in regions_str.split(',')]
+                self._regions = [r.strip() for r in regions_str.split(',') if r.strip()]
             else:
                 # Default to the configured region
                 self._regions = [self._config.get('region', 'us-ashburn-1')]
@@ -281,9 +334,15 @@ class OCIConfig:
             logging.info(f"Loaded OCI config from {self.config_path}, profile: {self.profile}")
             logging.info(f"Configured regions: {', '.join(self._regions)}")
             
-        except Exception as e:
+        except (ValueError, FileNotFoundError) as e:
             logging.error(f"Failed to load OCI config: {e}")
             raise
+        except Exception as e:
+            logging.error(f"Failed to load OCI config: {e}")
+            raise RuntimeError(
+                "OCI config could not be loaded. Verify your config file syntax and required fields. "
+                f"Details: {e}"
+            )
     
     def get_config(self) -> Dict[str, Any]:
         """Get the OCI configuration dictionary"""

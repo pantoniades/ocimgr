@@ -28,3 +28,12 @@ build/
 *.egg
 *.whl
 *.log
+ocimgr-*.log
+delete_*.log
+inventory_*.txt
+compartments.json
+all-compartments-*.txt
+delete-compartments-*.txt
+remaining*_compartments*.txt
+target_compartments*.txt
+falcon-list*.txt

@@ -132,12 +132,12 @@ def test_delete_compartment_refreshes_instance_pool_state(monkeypatch):
     assert "instance_pool" in result.output
 
 
-# additional test using the real delete-compartments file if it exists
+# Optional test using an externally supplied targets file (set OCIMGR_TARGETS_FILE)
 
 def test_delete_compartments_real_file(monkeypatch):
-    real_path = "/Users/philip/mysql-docs/ocimgr_clone/delete-compartments.txt"
-    if not os.path.exists(real_path):
-        pytest.skip("real delete-compartments file not present")
+    real_path = os.environ.get("OCIMGR_TARGETS_FILE")
+    if not real_path or not os.path.exists(real_path):
+        pytest.skip("real delete-compartments file not present (set OCIMGR_TARGETS_FILE)")
 
     # build fake compartments list from file comments and ocids
     comps = []

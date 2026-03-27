@@ -4,33 +4,82 @@ OCIMgr - Oracle Cloud Infrastructure Management Tool
 
 # OCIMgr
 
+OCIMgr is a lightweight toolkit for discovering and managing Oracle Cloud Infrastructure (OCI) resources asynchronously.
+It focuses on safe inventory collection and guided deletion workflows with clear logging and retry handling.
 
-# OCIMgr
+## ✅ Prerequisites
+- **Python 3.10+**
+- **OCI API key configured** and a valid `~/.oci/config` profile
 
-OCIMgr is a small toolkit for discovering and managing Oracle Cloud Infrastructure (OCI) resources asynchronously.
+## 📦 Installation
 
-Quick start
------------
+### 1) Create a virtual environment
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
 
-1. Create a virtual environment and install dependencies:
+### 2) Install dependencies
+```bash
+pip install -r requirements.txt
+pip install -e .
+```
 
+> **Tip:** `pip install -e .` installs the `ocimgr` CLI so you can run commands like `ocimgr inventory` directly.
+
+### 3) (Optional) Install test dependencies
+```bash
+pip install pytest pytest-asyncio
+```
+
+## 📤 Distribution (Sharing with New Users)
+
+### Option 1: Install from a Git repo (recommended for teams)
+```bash
+pip install git+https://github.com/your-org/ocimgr.git
+```
+
+### Option 2: Build and share a wheel (recommended for internal releases)
+```bash
+python -m pip install --upgrade build
+python -m build
+ls dist/
+# share the .whl file (e.g., ocimgr-0.1.0-py3-none-any.whl)
+```
+New users can install the wheel with:
+```bash
+pip install /path/to/ocimgr-0.1.0-py3-none-any.whl
+```
+
+### Option 3: Zip and run locally (simplest)
+```bash
+zip -r ocimgr.zip .
+```
+New users unzip and run:
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-# install test deps
-pip install pytest pytest-asyncio
+pip install -e .
+python -m ocimgr.cli inventory
 ```
 
-2. Run the CLI (example):
+## ✅ Quick Start
 
+### Verify your OCI config and run inventory
 ```bash
 # after installing package (editable) or running via python -m
+ocimgr inventory --compartment-list ./all-compartments.txt
+# or
 python -m ocimgr.cli inventory --compartment-list ./all-compartments.txt
 ```
 
-Testing
--------
+### Interactive mode
+```bash
+python -m ocimgr.cli interactive
+```
+
+## Testing
 
 Run unit tests with pytest:
 
@@ -44,31 +93,26 @@ Run the inventory fast-count tests only:
 pytest -q tests/test_inventory_fast_counts.py
 ```
 
-Notes
------
-- The project relies on OCI config and credentials. See OCI SDK documentation for configuring `~/.oci/config`.
-- The tests in `tests/` are lightweight and use mocks to avoid network calls.
+## 🧭 Configuration
 
-
-## ✅ Features (Current Scope)
-- Multi-region discovery (async)
-- High-level **inventory (counts-only)** to avoid throttling
-- Interactive and scripted CLI usage
-- JSON/CSV export for future bulk-delete workflows
-
-## Installation
-```bash
-pip install -r requirements.txt
-pip install -e .
-```
-
-## OCI Config Setup
 OCIMgr reads OCI config from:
-- `~/.oci/config` (default)
+- `~/.oci/config` (default OCI SDK location)
 - `~/.oci_mgr/config`
 - `./oci_mgr.ini`
 
-### Example config with multiple regions
+You can also pass `--config` and `--profile` to the CLI.
+
+### Required keys per profile
+Each config profile **must** include:
+- `user`
+- `fingerprint`
+- `key_file`
+- `tenancy`
+- `region`
+
+If any required key is missing, OCIMgr will raise a clear error describing what is missing.
+
+### Example config with multiple regions (placeholders)
 ```ini
 [DEFAULT]
 user=ocid1.user.oc1..xxxx
@@ -79,7 +123,35 @@ region=us-ashburn-1
 regions=us-ashburn-1,us-phoenix-1
 ```
 
-## Quick Start
+### Region cache
+OCIMgr stores a `.region_cache` JSON file next to your OCI config. If it is missing,
+inventory will discover subscribed regions and create it.
+
+## 🛠️ Troubleshooting Config Errors
+
+| Symptom | What it means | Fix |
+| --- | --- | --- |
+| `Config file not found` | The config path does not exist | Pass `--config /path/to/config` or create `~/.oci/config`. |
+| `profile 'X' not found` | The named profile section is missing | Add `[X]` section to the config file or use `--profile`. |
+| `missing required keys` | Keys like `user`, `tenancy`, or `region` are missing | Add the missing keys to the profile. |
+| `OCI API key file not found` | The `key_file` path does not exist | Update the path or generate a new API key. |
+
+If you still see auth errors (401/403), confirm your API key is uploaded to OCI and the
+user has the correct policies for the target compartments.
+
+## Notes
+- The project relies on OCI config and credentials. See OCI SDK documentation for configuring `~/.oci/config`.
+- The tests in `tests/` are lightweight and use mocks to avoid network calls.
+- **Log files contain resource identifiers** (OCIDs, compartment names). Avoid committing logs to Git.
+
+
+## ✅ Features (Current Scope)
+- Multi-region discovery (async)
+- High-level **inventory (counts-only)** to avoid throttling
+- Interactive and scripted CLI usage
+- JSON/CSV export for future bulk-delete workflows
+
+## CLI Examples
 
 ### Write CLI output to a file (global)
 ```bash
@@ -209,7 +281,7 @@ ocimgr delete-compartment "Finance" --skip-unauthorized
 ocimgr delete-compartment "Finance" --no-skip-unauthorized
 ```
 
-### Delete a compartment by OCID (with confirmation)
+### Delete a compartment by OCID (with confirmation, placeholder OCID)
 ```bash
 ocimgr delete-compartment ocid1.compartment.oc1..xxxx
 ```
