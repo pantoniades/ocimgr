@@ -50,16 +50,28 @@ class DummyDeletionCLI(DummyCLI):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         class DummySession:
+            oci_config = {"tenancy": "ocid1.tenancy.oc1..fake", "region": "us-ashburn-1"}
+
             def get_all_regions(self):
+                return ["us-ashburn-1"]
+
+            def get_authorized_regions(self):
                 return ["us-ashburn-1"]
 
             def get_current_region(self):
                 return "us-ashburn-1"
 
+            def mark_region_unauthorized(self, region):
+                pass
+
+            async def get_client(self, service, region=None):
+                raise Exception("dummy client")
+
             async def close(self):
                 return
 
         self.session = DummySession()
+        self.compartment_manager = None
 
     async def discover_resources(self, compartment_ids, resource_type_filter=None, skip_unauthorized=True):
         return {
@@ -67,6 +79,9 @@ class DummyDeletionCLI(DummyCLI):
                 DummyResource("instance_pool", compartment_ids[0]),
             ]
         }
+
+    async def discover_fast_counts(self, compartment_ids, **kwargs):
+        return {cid: {"instance_pool": {"count": 1, "regions": ["us-ashburn-1"]}} for cid in compartment_ids}
 
     async def execute_deletion(self, resources, *args, **kwargs):
         return {"total": len(resources), "successful": len(resources), "failed": 0, "results": []}

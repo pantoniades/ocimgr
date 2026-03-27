@@ -12,8 +12,9 @@ import oci
 from oci.exceptions import ServiceError
 
 from ..core import (
-    AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder, 
-    register_resource_type, AsyncOCISession, OperationResult, ResourceStatus
+    AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder,
+    register_resource_type, AsyncOCISession, OperationResult, ResourceStatus,
+    discover_across_regions
 )
 from ..utils import run_with_backoff
 
@@ -47,9 +48,9 @@ class OKECluster(AbstractOCIResource, AsyncResourceMixin):
             try:
                 container_client = await session.get_client('container_engine', region)
                 
-                # Run list operation in thread pool
                 async def list_operation():
                     return await cls._run_oci_operation(
+                        oci.pagination.list_call_get_all_results,
                         container_client.list_clusters,
                         compartment_id=compartment_id
                     )
@@ -134,31 +135,10 @@ class OKECluster(AbstractOCIResource, AsyncResourceMixin):
         
             return clusters
         
-        # Discover across all regions concurrently (with concurrency limit)
-        max_concurrent = getattr(session, "max_concurrent_regions", 5)
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        async def guarded_discover(region: str) -> List['OKECluster']:
-            async with semaphore:
-                return await discover_in_region(region)
-
-        region_tasks = [
-            guarded_discover(region)
-            for region in session.get_authorized_regions()
-        ]
-        
-        region_results = await asyncio.gather(*region_tasks, return_exceptions=True)
-        
-        # Flatten results
-        all_clusters = []
-        for result in region_results:
-            if isinstance(result, list):
-                all_clusters.extend(result)
-            elif isinstance(result, Exception):
-                logging.error(f"Region discovery failed: {result}")
-        
-        logging.info(f"Discovered {len(all_clusters)} OKE clusters in compartment {compartment_id}")
-        return all_clusters
+        return await discover_across_regions(
+            session, discover_in_region, cls.resource_type,
+            skip_unauthorized=skip_unauthorized,
+        )
     
     async def disable_delete_protection(self) -> OperationResult:
         """OKE clusters don't have delete protection"""

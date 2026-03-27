@@ -31,18 +31,13 @@ class AsyncResourceMixin:
     async def _run_oci_operation(operation, *args, **kwargs):
         """
         Run OCI SDK operation in thread pool to avoid blocking.
-        Handles both positional and keyword arguments properly.
+        Uses the default executor (shared thread pool) instead of creating
+        a new ThreadPoolExecutor per call.
         """
         try:
-            loop = asyncio.get_event_loop()
-            
-            # Use functools.partial to create a no-argument callable
+            loop = asyncio.get_running_loop()
             bound_operation = functools.partial(operation, *args, **kwargs)
-            
-            with ThreadPoolExecutor(max_workers=1) as executor:
-                result = await loop.run_in_executor(executor, bound_operation)
-                return result
-                
+            return await loop.run_in_executor(None, bound_operation)
         except Exception as e:
             logging.debug(f"OCI operation failed: {e}")
             raise
@@ -108,6 +103,48 @@ def register_resource_type(cls: Type['AbstractOCIResource']) -> Type['AbstractOC
 def get_registered_resource_types() -> Dict[str, Type['AbstractOCIResource']]:
     """Get all registered resource types"""
     return _RESOURCE_REGISTRY.copy()
+
+
+async def discover_across_regions(
+    session: 'AsyncOCISession',
+    discover_fn,
+    resource_type_name: str,
+    skip_unauthorized: bool = False,
+) -> list:
+    """Run a per-region discovery function across all authorized regions.
+
+    *discover_fn* is an async callable ``(region: str) -> List[T]`` that
+    discovers resources in a single region.  This helper handles the
+    semaphore, ``asyncio.gather``, error flattening, and logging that every
+    resource model previously duplicated.
+
+    Returns a flat list of all discovered items.
+    """
+    max_concurrent = getattr(session, "max_concurrent_regions", 5)
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def guarded(region: str):
+        async with semaphore:
+            return await discover_fn(region)
+
+    regions = session.get_authorized_regions()
+    region_results = await asyncio.gather(
+        *(guarded(r) for r in regions),
+        return_exceptions=True,
+    )
+
+    all_items: list = []
+    for result in region_results:
+        if isinstance(result, list):
+            all_items.extend(result)
+        elif isinstance(result, Exception):
+            logging.error("Region discovery failed for %s: %s", resource_type_name, result)
+
+    logging.info(
+        "Discovered %d %s(s) across %d regions",
+        len(all_items), resource_type_name, len(regions),
+    )
+    return all_items
 
 
 class DeletionOrder(Enum):
@@ -386,7 +423,7 @@ class AsyncOCISession:
             
             try:
                 # Initialize clients in thread pool to avoid blocking
-                await asyncio.get_event_loop().run_in_executor(
+                await asyncio.get_running_loop().run_in_executor(
                     self._executor,
                     self._create_region_clients,
                     region,
@@ -473,48 +510,6 @@ class AsyncOCISession:
     def get_authorized_regions(self) -> List[str]:
         """Return regions excluding those marked unauthorized."""
         return [region for region in self.regions if region not in self._unauthorized_regions]
-    
-    async def execute_across_regions(
-        self, 
-        func, 
-        *args, 
-        max_concurrent: Optional[int] = None,
-        **kwargs
-    ) -> Dict[str, Any]:
-        """
-        Execute an async function across all regions concurrently.
-        
-        Args:
-            func: Async function to execute (should accept session as first param)
-            *args: Additional arguments to pass to function
-            max_concurrent: Max concurrent regions (uses default if None)
-            **kwargs: Additional keyword arguments to pass to function
-        
-        Returns:
-            Dictionary mapping region names to function results
-        """
-        max_concurrent = max_concurrent or self.max_concurrent_regions
-        semaphore = asyncio.Semaphore(max_concurrent)
-        
-        async def execute_in_region(region: str) -> tuple[str, Any]:
-            async with semaphore:
-                original_region = self._current_region
-                try:
-                    self.set_current_region(region)
-                    result = await func(self, *args, **kwargs)
-                    return region, result
-                except Exception as e:
-                    logging.error(f"Error executing function in region {region}: {e}")
-                    return region, None
-                finally:
-                    self.set_current_region(original_region)
-        
-        # Execute across all regions
-        tasks = [execute_in_region(region) for region in self.regions]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Convert to dictionary
-        return {region: result for region, result in results if not isinstance(result, Exception)}
     
     async def close(self) -> None:
         """Clean up resources"""
@@ -702,11 +697,6 @@ async def setup_async_logging(log_file: Optional[str] = None, level: str = "INFO
     
     logging.info(f"Async logging initialized - Level: {level}, File: {log_file}")
     return log_file
-
-
-def setup_logging(log_file: Optional[str] = None, level: str = "INFO") -> None:
-    """Synchronous wrapper for logging setup"""
-    asyncio.create_task(setup_async_logging(log_file, level))
 
 
 if __name__ == "__main__":

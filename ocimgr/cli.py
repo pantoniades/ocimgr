@@ -1,899 +1,36 @@
 #!/usr/bin/env python3
 """
-OCIMgr CLI Interface - Python 3.13 with corrected match syntax
-Command-line interface for OCI resource management using proper match statements
-"""
-
-#!/usr/bin/env python3
-"""
-OCIMgr CLI Interface - Python 3.13 with corrected imports
-Command-line interface for OCI resource management using proper match statements
+OCIMgr CLI Interface
+Command-line interface for OCI resource management
 """
 
 import sys
-import os
 import asyncio
 import logging
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Union, Callable
-from dataclasses import asdict
-from enum import Enum
+from typing import List, Dict, Any, Optional
 import click
 import oci
 import random
 
-# Use ABSOLUTE imports instead of relative imports
 from ocimgr.core import (
-    OCIConfig, AsyncOCISession, setup_async_logging, 
-    get_registered_resource_types, AbstractOCIResource,
-    ResourceDiscoveryEngine, OperationResult, ResourceStatus,
-    AsyncResourceMixin
+    OCIConfig, AsyncOCISession,
+    get_registered_resource_types,
+    ResourceDiscoveryEngine, ResourceStatus,
+    AsyncResourceMixin,
 )
 from ocimgr.utils import (
-    ProgressTracker, ProgressItem, OutputFormatter, 
-    InteractiveSelector, format_duration, run_with_backoff
+    OutputFormatter, InteractiveSelector, format_duration, run_with_backoff,
+)
+from ocimgr.cli_utils import (
+    resource_icon, async_command, install_output_tee,
+)
+from ocimgr.app import OCIMgrAsyncCLI, CLIAction
+from ocimgr.region_cache import (
+    get_region_cache_path, load_region_cache,
+    refresh_session_regions, discover_and_cache_regions,
 )
 from ocimgr.models.compartment import CompartmentManager
-
-
-def get_region_cache_path(config_path: Optional[str]) -> Path:
-    """Resolve the .region_cache file path next to the OCI config."""
-    if config_path:
-        return Path(config_path).expanduser().resolve().parent / ".region_cache"
-
-    for candidate in OCIConfig.DEFAULT_CONFIG_PATHS:
-        path = Path(candidate).expanduser()
-        if path.exists():
-            return path.resolve().parent / ".region_cache"
-
-    return Path.home() / ".oci_mgr" / ".region_cache"
-
-
-def load_region_cache(cache_path: Path) -> Optional[List[str]]:
-    """Load cached regions from disk if present and valid."""
-    if not cache_path.exists():
-        return None
-
-    try:
-        import json
-
-        payload = json.loads(cache_path.read_text(encoding="utf-8"))
-        regions = payload.get("regions")
-        if isinstance(regions, list) and all(isinstance(r, str) for r in regions):
-            return [r.strip() for r in regions if r.strip()]
-    except Exception:
-        return None
-
-    return None
-
-
-def write_region_cache(cache_path: Path, regions: List[str], profile: str) -> None:
-    """Persist regions to the cache file in JSON format."""
-    import json
-    from datetime import datetime
-
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "profile": profile,
-        "updated_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
-        "regions": sorted(set(regions))
-    }
-    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-
-async def refresh_session_regions(
-    cli_app: "OCIMgrAsyncCLI",
-    regions: List[str],
-    verbose: bool,
-    label: str
-) -> None:
-    """Rebuild the session with an updated region list."""
-    if not regions:
-        return
-
-    await cli_app.session.close()
-    cli_app.session.config.set_regions(regions)
-    cli_app.session = AsyncOCISession(cli_app.session.config)
-    await cli_app.session.wait_until_ready()
-    cli_app.compartment_manager = CompartmentManager(cli_app.session)
-    cli_app.discovery_engine = ResourceDiscoveryEngine(cli_app.session)
-    if verbose:
-        click.echo(f"🌍 Using {label} regions: {', '.join(regions)}")
-
-
-async def discover_and_cache_regions(
-    cli_app: "OCIMgrAsyncCLI",
-    cache_path: Path,
-    verbose: bool
-) -> List[str]:
-    """Discover subscribed regions and persist them to the cache."""
-    identity_client = await cli_app.session.get_client('identity')
-    region_response = await AsyncResourceMixin._run_oci_operation(
-        identity_client.list_region_subscriptions,
-        tenancy_id=cli_app.session.oci_config['tenancy']
-    )
-    subscribed_regions = [r.region_name for r in region_response.data]
-    if subscribed_regions:
-        write_region_cache(cache_path, subscribed_regions, cli_app.profile)
-        if verbose:
-            click.echo(f"🗃️  Cached {len(subscribed_regions)} regions to {cache_path}")
-    return subscribed_regions
-
-
-
-class CLIAction(Enum):
-    """Available CLI actions for match statement handling"""
-    LIST_RESOURCES = "list_resources"
-    DELETE_RESOURCES = "delete_resources" 
-    EXPORT_DATA = "export_data"
-    VALIDATE_COMPARTMENT = "validate_compartment"
-    QUIT = "quit"
-
-
-class OCIMgrAsyncCLI:
-    """
-    Modern async CLI application class using Python 3.13 features.
-    Handles concurrent operations and provides interactive experience.
-    """
-    
-    def __init__(self, config_path: Optional[str] = None, profile: str = "DEFAULT", 
-                 log_level: str = "INFO"):
-        self.config_path = config_path
-        self.profile = profile
-        self.log_level = log_level
-        self.session: Optional[AsyncOCISession] = None
-        self.compartment_manager: Optional[CompartmentManager] = None
-        self.discovery_engine: Optional[ResourceDiscoveryEngine] = None
-        
-        # Track current operation for cancellation
-        self._current_operation: Optional[asyncio.Task] = None
-    
-    async def initialize(self) -> None:
-        """Initialize async components"""
-        log_file = await setup_async_logging(level=self.log_level)
-        click.echo(f"📝 Logging to {log_file}")
-        
-        try:
-            config = OCIConfig(self.config_path, self.profile)
-            self.session = AsyncOCISession(config)
-            
-            # Wait for client initialization
-            await self.session.wait_until_ready()
-            
-            self.compartment_manager = CompartmentManager(self.session)
-            self.discovery_engine = ResourceDiscoveryEngine(self.session)
-            
-            click.echo(f"✓ Initialized OCIMgr for regions: {', '.join(self.session.get_all_regions())}")
-            click.echo(f"✓ Current region: {self.session.get_current_region()}")
-            click.echo(f"✓ Registered resource types: {len(get_registered_resource_types())}")
-            
-        except Exception as e:
-            click.echo(f"✗ Failed to initialize OCIMgr: {e}", err=True)
-            raise
-    
-    async def cleanup(self) -> None:
-        """Cleanup async resources"""
-        if self._current_operation and not self._current_operation.done():
-            self._current_operation.cancel()
-            try:
-                await self._current_operation
-            except asyncio.CancelledError:
-                pass
-        
-        if self.session:
-            await self.session.close()
-    
-    async def list_compartments(self) -> List[Dict[str, Any]]:
-        """List all accessible compartments"""
-        try:
-            compartments = await self.compartment_manager.list_compartments()
-            return compartments
-        except Exception as e:
-            click.echo(f"✗ Error listing compartments: {e}", err=True)
-            return []
-    
-    async def discover_resources(
-        self, 
-        compartment_ids: List[str],
-        resource_type_filter: Optional[List[str]] = None,
-        skip_unauthorized: bool = True
-    ) -> Dict[str, List[AbstractOCIResource]]:
-        """
-        Discover resources with concurrent multi-region scanning.
-        
-        Args:
-            compartment_ids: List of compartment IDs to scan
-            resource_type_filter: Optional filter for specific resource types
-        
-        Returns:
-            Dictionary mapping compartment_id to list of resources
-        """
-        click.echo(f"🔍 Discovering resources across {len(self.session.get_all_regions())} regions...")
-        
-        try:
-            # Create cancellable task
-            self._current_operation = asyncio.create_task(
-                self.discovery_engine.discover_all_resources(
-                    compartment_ids, 
-                    resource_type_filter,
-                    skip_unauthorized=skip_unauthorized
-                )
-            )
-            
-            # Show progress while discovering
-            progress_task = asyncio.create_task(self._show_discovery_progress())
-            
-            # Wait for discovery to complete
-            results = await self._current_operation
-            
-            # Cancel progress display
-            progress_task.cancel()
-            try:
-                await progress_task
-            except asyncio.CancelledError:
-                pass
-            
-            click.echo("✓ Discovery completed")
-            return results
-            
-        except asyncio.CancelledError:
-            click.echo("\n⚠️ Discovery cancelled by user")
-            return {}
-        except Exception as e:
-            click.echo(f"✗ Discovery failed: {e}", err=True)
-            return {}
-        finally:
-            self._current_operation = None
-
-    async def discover_resource_counts(
-        self,
-        compartment_ids: List[str],
-        resource_type_filter: Optional[List[str]] = None,
-        max_concurrent: int = 3
-    ) -> Dict[str, Dict[str, int]]:
-        """
-        Discover resource counts per compartment with throttling-aware concurrency.
-        
-        Returns:
-            Dict of compartment_id -> resource_type -> count
-        """
-        resource_types = get_registered_resource_types()
-        if resource_type_filter:
-            resource_types = {
-                name: cls for name, cls in resource_types.items()
-                if name in resource_type_filter
-            }
-
-        results: Dict[str, Dict[str, int]] = {}
-
-        async def discover_type(compartment_id: str, resource_type_name: str, resource_cls):
-            async def operation():
-                resources = await resource_cls.discover(self.session, compartment_id)
-                return len(resources)
-
-            count = await run_with_backoff(operation)
-            return resource_type_name, count
-
-        for compartment_id in compartment_ids:
-            semaphore = asyncio.Semaphore(max_concurrent)
-            tasks = []
-
-            for resource_type_name, resource_cls in resource_types.items():
-                async def guarded_discover(rt_name=resource_type_name, rt_cls=resource_cls):
-                    async with semaphore:
-                        return await discover_type(compartment_id, rt_name, rt_cls)
-
-                tasks.append(guarded_discover())
-
-            type_results = await asyncio.gather(*tasks, return_exceptions=True)
-            compartment_counts: Dict[str, int] = {}
-
-            for result in type_results:
-                if isinstance(result, tuple):
-                    resource_type_name, count = result
-                    compartment_counts[resource_type_name] = count
-                elif isinstance(result, Exception):
-                    logging.warning(f"Count discovery failed in compartment {compartment_id}: {result}")
-
-            results[compartment_id] = compartment_counts
-
-        return results
-
-    async def discover_fast_counts(
-        self,
-        compartment_ids: List[str],
-        resource_type_filter: Optional[List[str]] = None,
-        max_concurrent: int = 1,
-        verbose: bool = False,
-        skip_unauthorized: bool = True,
-        request_timeout: float = 60.0
-    ) -> Dict[str, Dict[str, Dict[str, Any]]]:
-        """
-        Fast, counts-only discovery using list calls (no per-resource detail).
-        Designed to reduce throttling.
-        """
-        resource_map = {
-            "compute_instance": ("compute", "list_instances"),
-            "instance_pool": ("compute_management", "list_instance_pools"),
-            "autonomous_database": ("database", "list_autonomous_databases"),
-            "mysql_db_system": ("mysql", "list_db_systems"),
-            "oke_cluster": ("container_engine", "list_clusters")
-        }
-
-        if resource_type_filter:
-            resource_map = {
-                name: value for name, value in resource_map.items()
-                if name in resource_type_filter
-            }
-
-        results: Dict[str, Dict[str, int]] = {}
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        async def list_count(
-            compartment_id: str,
-            resource_type: str,
-            service: str,
-            method_name: str,
-            region: str
-        ) -> tuple[str, int]:
-            async def operation():
-                client = await self.session.get_client(service, region)
-                method = getattr(client, method_name)
-                response = await asyncio.wait_for(
-                    AsyncResourceMixin._run_oci_operation(
-                        oci.pagination.list_call_get_all_results,
-                        method,
-                        compartment_id=compartment_id
-                    ),
-                    timeout=request_timeout
-                )
-                terminal_states = {"TERMINATED", "TERMINATING", "DELETED", "DELETING"}
-                active_count = 0
-                for item in response.data:
-                    lifecycle_state = getattr(item, "lifecycle_state", None)
-                    if lifecycle_state and str(lifecycle_state).upper() in terminal_states:
-                        continue
-                    active_count += 1
-                return region, active_count
-
-            async with semaphore:
-                try:
-                    return await run_with_backoff(operation)
-                except asyncio.TimeoutError:
-                    logging.warning(
-                        "Fast count timed out for %s in %s (%s)",
-                        resource_type,
-                        compartment_id,
-                        region
-                    )
-                    return region, 0
-                except oci.exceptions.ServiceError as e:
-                    if e.status in {401, 403}:
-                        self.session.mark_region_unauthorized(region)
-                        if skip_unauthorized:
-                            if verbose:
-                                logging.warning(f"Skipping unauthorized region {region} for {resource_type}: {e}")
-                            return region, 0
-                    raise
-
-        for compartment_id in compartment_ids:
-            counts: Dict[str, int] = {}
-
-            for resource_type, (service, method_name) in resource_map.items():
-                regions = (
-                    self.session.get_authorized_regions()
-                    if skip_unauthorized
-                    else self.session.get_all_regions()
-                )
-                tasks = [
-                    list_count(compartment_id, resource_type, service, method_name, region)
-                    for region in regions
-                ]
-
-                logging.info(
-                    "Fast counts for %s in compartment %s across %d regions",
-                    resource_type,
-                    compartment_id,
-                    len(regions)
-                )
-                results_per_region = await asyncio.gather(*tasks, return_exceptions=True)
-                total_count = 0
-                regions_with_resources: List[str] = []
-
-                for result in results_per_region:
-                    if isinstance(result, Exception):
-                        message = f"Fast count failed for {resource_type} in {compartment_id}: {result}"
-                        if verbose:
-                            logging.warning(message)
-                        else:
-                            logging.debug(message)
-                    else:
-                        region_name, region_count = result
-                        total_count += region_count
-                        if region_count > 0:
-                            regions_with_resources.append(region_name)
-
-                counts[resource_type] = {
-                    "count": total_count,
-                    "regions": sorted(set(regions_with_resources))
-                }
-                logging.info(
-                    "Fast count result for %s in compartment %s: %d",
-                    resource_type,
-                    compartment_id,
-                    total_count
-                )
-
-            results[compartment_id] = counts
-
-        return results
-    
-    async def _show_discovery_progress(self) -> None:
-        """Show animated progress during discovery"""
-        spinner_chars = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-        i = 0
-        
-        try:
-            while True:
-                click.echo(f"\r{spinner_chars[i % len(spinner_chars)]} Scanning resources...", nl=False)
-                await asyncio.sleep(0.1)
-                i += 1
-        except asyncio.CancelledError:
-            click.echo("\r" + " " * 30 + "\r", nl=False)  # Clear the line
-    
-    async def create_deletion_plan(
-        self,
-        resources: List[AbstractOCIResource],
-        balance_by_region: bool = False
-    ) -> List[AbstractOCIResource]:
-        """
-        Create an optimized deletion plan with dependency analysis.
-        
-        Args:
-            resources: List of resources to delete
-        
-        Returns:
-            Ordered list of resources for deletion
-        """
-        if not resources:
-            return []
-        
-        # Sort by deletion order priority and estimated time
-        sorted_resources = sorted(
-            resources, 
-            key=lambda r: (r.get_deletion_order_priority(), r.get_estimated_deletion_time())
-        )
-
-        if balance_by_region:
-            sorted_resources = self._balance_deletion_plan_by_region(sorted_resources)
-            click.echo("🌍 Balanced deletion plan by region (round-robin) within each deletion phase")
-        
-        click.echo(f"\n📋 Deletion Plan ({len(sorted_resources)} resources):")
-        click.echo("=" * 60)
-        
-        total_time = 0
-        for i, resource in enumerate(sorted_resources, 1):
-            estimated_time = resource.get_estimated_deletion_time()
-            total_time += estimated_time
-            
-            # Use match statement for resource type formatting (CORRECTED)
-            icon = "📦"  # default
-            match resource.info.resource_type:
-                case "compute_instance":
-                    icon = "🖥️"
-                case "instance_pool":
-                    icon = "🧰"
-                case "autonomous_database" | "mysql_db_system":
-                    icon = "🗄️"
-                case "oke_cluster":
-                    icon = "☸️"
-                case "block_volume":
-                    icon = "💾"
-                case _:
-                    icon = "📦"
-            
-            protection_marker = " 🔒" if resource.info.has_delete_protection else ""
-            
-            click.echo(f"  {i:2d}. {icon} {resource.info.resource_type}: {resource.info.name}")
-            click.echo(f"      Region: {resource.info.region} | Est: {format_duration(estimated_time)}{protection_marker}")
-        
-        click.echo("=" * 60)
-        click.echo(f"📊 Total estimated time: {format_duration(total_time)}")
-        
-        if any(r.info.has_delete_protection for r in sorted_resources):
-            click.echo("🔒 Resources with delete protection will be processed first")
-        
-        return sorted_resources
-
-    @staticmethod
-    def _balance_deletion_plan_by_region(
-        resources: List[AbstractOCIResource]
-    ) -> List[AbstractOCIResource]:
-        """Round-robin resources by region within each deletion order phase."""
-        if not resources:
-            return []
-
-        by_order: Dict[int, Dict[str, List[AbstractOCIResource]]] = {}
-        for resource in resources:
-            order = resource.get_deletion_order_priority()
-            region = resource.info.region or "unknown"
-            by_order.setdefault(order, {}).setdefault(region, []).append(resource)
-
-        balanced: List[AbstractOCIResource] = []
-        for order in sorted(by_order.keys()):
-            region_groups = by_order[order]
-            for region_items in region_groups.values():
-                region_items.sort(key=lambda r: r.get_estimated_deletion_time())
-
-            regions = sorted(region_groups.keys())
-            while any(region_groups[region] for region in regions):
-                for region in regions:
-                    if region_groups[region]:
-                        balanced.append(region_groups[region].pop(0))
-
-        return balanced
-    
-    async def execute_deletion(
-        self, 
-        resources: List[AbstractOCIResource], 
-        dry_run: bool = True,
-        delete_concurrency: int = 3,
-        delete_retry_max: int = 6,
-        delete_retry_base_delay: float = 0.75,
-        delete_retry_max_delay: float = 12.0
-    ) -> Dict[str, Any]:
-        """
-        Execute resource deletion with async progress tracking.
-        
-        Args:
-            resources: Ordered list of resources to delete
-            dry_run: If True, only simulate deletion
-        
-        Returns:
-            Summary of deletion results
-        """
-        if not resources:
-            click.echo("No resources to delete.")
-            return {"total": 0, "successful": 0, "failed": 0}
-        
-        action = "🧪 DRY RUN" if dry_run else "🗑️  DELETION"
-        click.echo(f"\n{action} EXECUTION")
-        click.echo("=" * 50)
-        
-        # Create progress items
-        progress_items = [
-            ProgressItem(f"{r.info.resource_type}: {r.info.name}", r.get_estimated_deletion_time())
-            for r in resources
-        ]
-        
-        # Initialize progress tracker
-        tracker = ProgressTracker(progress_items, show_progress=not dry_run)
-        tracker.start()
-        
-        results = []
-        
-        try:
-            current_concurrency = max(1, delete_concurrency)
-            throttle_detected = False
-            
-            def on_retry(exc: Exception, delay: float, attempt: int) -> None:
-                nonlocal throttle_detected
-                error_str = str(exc)
-                if "429" in error_str or "Circuit" in error_str:
-                    throttle_detected = True
-
-            async def process_resource(i: int, resource: AbstractOCIResource) -> OperationResult:
-                tracker.start_item(i)
-                
-                if dry_run:
-                    click.echo(f"[DRY RUN] Would delete {resource.info.resource_type}: {resource.info.name}")
-                    await asyncio.sleep(0.1)
-                    result = OperationResult(
-                        resource_ocid=resource.info.ocid,
-                        operation="dry_run_delete",
-                        status=ResourceStatus.COMPLETED,
-                        message="Dry run successful"
-                    )
-                    tracker.complete_item(i)
-                    return result
-
-                return await self._delete_single_resource(
-                    resource,
-                    i,
-                    tracker,
-                    delete_retry_max=delete_retry_max,
-                    delete_retry_base_delay=delete_retry_base_delay,
-                    delete_retry_max_delay=delete_retry_max_delay,
-                    on_retry=on_retry
-                )
-            
-            index = 0
-            while index < len(resources):
-                throttle_detected = False
-                batch = resources[index:index + current_concurrency]
-                deletion_tasks = [
-                    process_resource(i, resource)
-                    for i, resource in enumerate(batch, start=index)
-                ]
-                batch_results = await asyncio.gather(*deletion_tasks, return_exceptions=True)
-                results.extend(batch_results)
-                
-                if throttle_detected and current_concurrency > 1:
-                    current_concurrency = max(1, current_concurrency - 1)
-                    click.echo(
-                        f"⚠️  Throttling detected. Reducing delete concurrency to {current_concurrency}"
-                    )
-                
-                index += len(batch)
-            
-        except asyncio.CancelledError:
-            click.echo("\n⚠️ Deletion cancelled by user")
-        except Exception as e:
-            click.echo(f"\n✗ Deletion execution failed: {e}", err=True)
-        finally:
-            tracker.finish()
-            self._current_operation = None
-        
-        # Calculate summary using corrected match syntax
-        successful = 0
-        failed = 0
-        
-        for result in results:
-            if isinstance(result, OperationResult):
-                match result.status:
-                    case ResourceStatus.COMPLETED:
-                        successful += 1
-                    case ResourceStatus.FAILED:
-                        failed += 1
-        
-        summary = {
-            "total": len(resources),
-            "successful": successful, 
-            "failed": failed,
-            "results": [r for r in results if isinstance(r, OperationResult)]
-        }
-        
-        # Print summary
-        tracker.print_summary()
-        self._print_deletion_summary(summary, dry_run)
-        
-        return summary
-    
-    async def _delete_single_resource(
-        self, 
-        resource: AbstractOCIResource, 
-        index: int, 
-        tracker: ProgressTracker,
-        delete_retry_max: int = 6,
-        delete_retry_base_delay: float = 0.75,
-        delete_retry_max_delay: float = 12.0,
-        on_retry: Optional[Callable[[Exception, float, int], None]] = None
-    ) -> OperationResult:
-        """Delete a single resource with error handling"""
-        try:
-            click.echo(f"🗑️  Deleting {resource.info.resource_type}: {resource.info.name}")
-
-            # Refresh lifecycle state before acting
-            try:
-                client_map = {
-                    "compute_instance": ("compute", "get_instance", "instance_id"),
-                    "instance_pool": ("compute_management", "get_instance_pool", "instance_pool_id"),
-                    "autonomous_database": ("database", "get_autonomous_database", "autonomous_database_id"),
-                    "mysql_db_system": ("mysql", "get_db_system", "db_system_id"),
-                    "oke_cluster": ("container_engine", "get_cluster", "cluster_id")
-                }
-                service, method_name, id_param = client_map.get(
-                    resource.info.resource_type,
-                    (None, None, None)
-                )
-                if service:
-                    client = await self.session.get_client(service, resource.info.region)
-                    method = getattr(client, method_name)
-                    response = await run_with_backoff(
-                        lambda: AsyncResourceMixin._run_oci_operation(
-                            method,
-                            **{id_param: resource.info.ocid}
-                        ),
-                        max_retries=delete_retry_max,
-                        base_delay=delete_retry_base_delay,
-                        max_delay=delete_retry_max_delay,
-                        on_retry=on_retry
-                    )
-                    if hasattr(response, "data") and hasattr(response.data, "lifecycle_state"):
-                        resource.info.lifecycle_state = response.data.lifecycle_state
-            except Exception as exc:
-                logging.debug(
-                    "Unable to refresh state for %s %s: %s",
-                    resource.info.resource_type,
-                    resource.info.ocid,
-                    exc
-                )
-            
-            # Step 1: Disable delete protection
-            if resource.info.has_delete_protection:
-                protection_result = await run_with_backoff(
-                    resource.disable_delete_protection,
-                    max_retries=delete_retry_max,
-                    base_delay=delete_retry_base_delay,
-                    max_delay=delete_retry_max_delay,
-                    on_retry=on_retry
-                )
-                
-                match protection_result.status:
-                    case ResourceStatus.COMPLETED:
-                        pass  # Continue with deletion
-                    case ResourceStatus.FAILED:
-                        tracker.complete_item(index, "Failed to disable delete protection")
-                        return protection_result
-                    case _:
-                        tracker.complete_item(index, f"Unknown protection status: {protection_result.status}")
-                        return protection_result
-            
-            # Step 2: Perform deletion
-            deletion_result = await run_with_backoff(
-                resource.delete,
-                max_retries=delete_retry_max,
-                base_delay=delete_retry_base_delay,
-                max_delay=delete_retry_max_delay,
-                on_retry=on_retry
-            )
-            
-            match deletion_result.status:
-                case ResourceStatus.COMPLETED:
-                    tracker.complete_item(index)
-                    return deletion_result
-                case ResourceStatus.FAILED:
-                    tracker.complete_item(index, deletion_result.message)
-                    return deletion_result
-                case _:
-                    tracker.complete_item(index, "Unknown deletion status")
-                    return OperationResult(
-                        resource_ocid=resource.info.ocid,
-                        operation="delete",
-                        status=ResourceStatus.FAILED,
-                        message="Unknown status returned"
-                    )
-                    
-        except Exception as e:
-            error_msg = f"Unexpected error: {e}"
-            tracker.complete_item(index, error_msg)
-            return OperationResult(
-                resource_ocid=resource.info.ocid,
-                operation="delete",
-                status=ResourceStatus.FAILED,
-                message=error_msg
-            )
-    
-    def _print_deletion_summary(self, summary: Dict[str, Any], dry_run: bool) -> None:
-        """Print a detailed deletion summary"""
-        action = "Dry Run" if dry_run else "Deletion"
-        
-        click.echo(f"\n📊 {action} Summary:")
-        click.echo("=" * 30)
-        click.echo(f"Total resources: {summary['total']}")
-        click.echo(f"✅ Successful: {summary['successful']}")
-        click.echo(f"❌ Failed: {summary['failed']}")
-        
-        if summary['failed'] > 0:
-            click.echo(f"\n❌ Failed Resources:")
-            for result in summary['results']:
-                match result.status:
-                    case ResourceStatus.FAILED:
-                        click.echo(f"  • {result.resource_ocid}: {result.message}")
-    
-    async def export_data(
-        self, 
-        data: Any, 
-        format_type: str, 
-        filename: Optional[str] = None
-    ) -> bool:
-        """
-        Export data to file in specified format asynchronously.
-        
-        Args:
-            data: Data to export
-            format_type: Output format (json, csv)
-            filename: Output filename (auto-generated if None)
-        
-        Returns:
-            True if successful, False otherwise
-        """
-        if filename is None:
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"ocimgr_export_{timestamp}.{format_type}"
-        
-        try:
-            # Prepare data for export using corrected match syntax
-            export_data = data
-            match format_type:
-                case 'json':
-                    # Convert resources to serializable format
-                    if isinstance(data, list) and data and hasattr(data[0], 'info'):
-                        export_data = [asdict(item.info) for item in data]
-                case 'csv':
-                    # Convert objects to dictionaries for CSV export
-                    if isinstance(data, list) and data and hasattr(data[0], 'info'):
-                        export_data = [asdict(item.info) for item in data]
-                case _:
-                    click.echo(f"Unsupported format: {format_type}")
-                    return False
-            
-            # Format content using corrected match syntax
-            content = ""
-            match format_type:
-                case 'json':
-                    content = OutputFormatter.format_json(export_data)
-                case 'csv':
-                    content = OutputFormatter.format_csv(export_data)
-                case _:
-                    content = ""
-            
-            # Save asynchronously
-            success = await asyncio.get_event_loop().run_in_executor(
-                None, 
-                OutputFormatter.save_to_file, 
-                content, 
-                filename
-            )
-            
-            if success:
-                click.echo(f"✓ Data exported to {filename}")
-                return True
-            else:
-                click.echo(f"✗ Failed to export data to {filename}")
-                return False
-                
-        except Exception as e:
-            click.echo(f"✗ Error exporting data: {e}")
-            return False
-
-
-# Async-aware Click commands
-def async_command(f):
-    """Decorator to make Click commands async-aware"""
-    def wrapper(*args, **kwargs):
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        task = loop.create_task(f(*args, **kwargs))
-        try:
-            return loop.run_until_complete(task)
-        except KeyboardInterrupt:
-            for pending in asyncio.all_tasks(loop):
-                pending.cancel()
-            loop.run_until_complete(
-                asyncio.gather(*asyncio.all_tasks(loop), return_exceptions=True)
-            )
-            raise
-        finally:
-            loop.close()
-    return wrapper
-
-
-def _install_output_tee(output_path: Optional[str]) -> None:
-    """Duplicate stdout/stderr to a file if output_path is provided."""
-    if not output_path:
-        return
-
-    log_path = Path(output_path).expanduser().resolve()
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-
-    class _Tee:
-        def __init__(self, *streams):
-            self._streams = streams
-
-        def write(self, data):
-            for stream in self._streams:
-                stream.write(data)
-            return len(data)
-
-        def flush(self):
-            for stream in self._streams:
-                stream.flush()
-
-    log_file = log_path.open("a", encoding="utf-8")
-    sys.stdout = _Tee(sys.stdout, log_file)
-    sys.stderr = _Tee(sys.stderr, log_file)
 
 
 @click.group()
@@ -910,7 +47,7 @@ def cli(ctx, config, profile, output, log_level):
     ctx.obj['profile'] = profile
     ctx.obj['output'] = output
     ctx.obj['log_level'] = log_level
-    _install_output_tee(output)
+    install_output_tee(output)
 
 
 @cli.command()
@@ -947,7 +84,6 @@ async def interactive(ctx):
                 
                 choice = click.prompt("\n🎯 Select an option", type=int, default=1)
                 
-                # Use match statement for menu handling (CORRECTED)
                 action = None
                 match choice:
                     case 1:
@@ -963,7 +99,6 @@ async def interactive(ctx):
                     case _:
                         action = None
                 
-                # Handle action using corrected match syntax
                 match action:
                     case CLIAction.LIST_RESOURCES:
                         await _handle_list_resources(cli_app)
@@ -1038,20 +173,7 @@ async def _handle_list_resources(cli_app: OCIMgrAsyncCLI) -> None:
         by_type[resource_type].append(resource)
     
     for resource_type, type_resources in by_type.items():
-        # Use match for type-specific icons (CORRECTED)
-        icon = "📦"  # default
-        match resource_type:
-            case "compute_instance":
-                icon = "🖥️"
-            case "instance_pool":
-                icon = "🧰"
-            case "autonomous_database" | "mysql_db_system":
-                icon = "🗄️"
-            case "oke_cluster":
-                icon = "☸️"
-            case _:
-                icon = "📦"
-        
+        icon = resource_icon(resource_type)
         click.echo(f"\n{icon} {resource_type.replace('_', ' ').title()} ({len(type_resources)}):")
         
         for resource in type_resources:
@@ -1182,7 +304,6 @@ async def _handle_export_data(cli_app: OCIMgrAsyncCLI) -> None:
         click.echo("📭 No resources found to export.")
         return
     
-    # Select export format using corrected approach
     formats = ['json', 'csv']
     format_names = ['📄 JSON', '📊 CSV']
     
@@ -1298,7 +419,6 @@ async def list_resources(ctx, compartment_id, format, output, resource_types, sk
                 'estimated_deletion_time': resource.get_estimated_deletion_time()
             })
         
-        # Format output using corrected match syntax
         content = ""
         match format:
             case 'table':
@@ -1376,10 +496,6 @@ async def delete_all(ctx, compartment_id, dry_run, yes, resource_types, skip_una
     finally:
         await cli_app.cleanup()
 
-# ================================================================================================
-# ADD THESE COMMANDS TO YOUR EXISTING ocimgr/cli.py FILE
-# Just paste this at the bottom, before "if __name__ == '__main__':"
-# ================================================================================================
 
 @cli.command("compartments")
 @click.option('--format', '-f', type=click.Choice(['table', 'json', 'csv']), 
@@ -1632,22 +748,7 @@ async def resources_command(ctx, compartment_numbers, format, output, types, ski
                 ]
                 
                 for resource_type, type_resources in by_type.items():
-                    # Get icon using match
-                    icon = "📦"
-                    match resource_type:
-                        case "compute_instance":
-                            icon = "🖥️"
-                        case "instance_pool":
-                            icon = "🧰"
-                        case "autonomous_database" | "mysql_db_system":
-                            icon = "🗄️"
-                        case "oke_cluster":
-                            icon = "☸️"
-                        case "block_volume":
-                            icon = "💾"
-                        case _:
-                            icon = "📦"
-                    
+                    icon = resource_icon(resource_type)
                     lines.append(f"\n{icon} {resource_type.replace('_', ' ').title()} ({len(type_resources)}):")
                     lines.append("-" * 60)
                     
@@ -1696,8 +797,8 @@ async def resources_command(ctx, compartment_numbers, format, output, types, ski
               help='Write qualified compartment list (comments + OCIDs) to file')
 @click.option('--compartment', '-c', help='Compartment name to scope (includes sub-compartments)')
 @click.option('--types', '-t', help='Resource types to include (comma-separated)')
-@click.option('--max-concurrent', type=int, default=1, help='Max concurrent API calls per compartment')
-@click.option('--compartment-concurrency', type=int, default=1, help='Max concurrent compartments to scan')
+@click.option('--max-concurrent', type=int, default=3, help='Max concurrent API calls per compartment (default: 3)')
+@click.option('--compartment-concurrency', type=int, default=3, help='Max concurrent compartments to scan (default: 3)')
 @click.option('--list-empty', is_flag=True, help='Include rows with zero counts')
 @click.option('--discover-regions', is_flag=True, help='Rebuild cached regions from OCI')
 @click.option('--skip-unauthorized/--no-skip-unauthorized', default=True,
@@ -1754,8 +855,11 @@ async def inventory_command(
                 click.echo(f"✅ Discovered {len(subscribed_regions)} subscribed regions")
                 logging.info("Discovered %d subscribed regions", len(subscribed_regions))
                 await refresh_session_regions(cli_app, subscribed_regions, verbose, "subscribed")
-            elif verbose:
-                click.echo("⚠️ No subscribed regions returned; using config default")
+            else:
+                click.echo(
+                    f"⚠️ Region discovery failed; falling back to config default: "
+                    f"{', '.join(cli_app.session.get_all_regions())}"
+                )
 
         click.echo("📋 Loading compartment list...")
         logging.info("Loading compartment list")
@@ -2075,8 +1179,11 @@ async def delete_compartment_command(
             if subscribed_regions:
                 click.echo(f"✅ Discovered {len(subscribed_regions)} subscribed regions")
                 await refresh_session_regions(cli_app, subscribed_regions, verbose, "subscribed")
-            elif verbose:
-                click.echo("⚠️ No subscribed regions returned; using config default")
+            else:
+                click.echo(
+                    f"⚠️ Region discovery failed; falling back to config default: "
+                    f"{', '.join(cli_app.session.get_all_regions())}"
+                )
 
         if regions:
             requested_regions = [r.strip() for r in regions.split(',') if r.strip()]

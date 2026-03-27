@@ -12,8 +12,9 @@ import oci
 from oci.exceptions import ServiceError
 
 from ocimgr.core import (
-    AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder, 
-    register_resource_type, AsyncOCISession, OperationResult, ResourceStatus
+    AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder,
+    register_resource_type, AsyncOCISession, OperationResult, ResourceStatus,
+    discover_across_regions
 )
 from ocimgr.utils import run_with_backoff, is_transient_network_error
 
@@ -47,9 +48,9 @@ class ComputeInstance(AbstractOCIResource, AsyncResourceMixin):
             try:
                 compute_client = await session.get_client('compute', region)
                 
-                # Run list operation in thread pool
                 async def list_operation():
                     return await cls._run_oci_operation(
+                        oci.pagination.list_call_get_all_results,
                         compute_client.list_instances,
                         compartment_id=compartment_id
                     )
@@ -112,31 +113,10 @@ class ComputeInstance(AbstractOCIResource, AsyncResourceMixin):
         
             return instances
         
-        # Discover across all regions concurrently (with concurrency limit)
-        max_concurrent = getattr(session, "max_concurrent_regions", 5)
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        async def guarded_discover(region: str) -> List['ComputeInstance']:
-            async with semaphore:
-                return await discover_in_region(region)
-
-        region_tasks = [
-            guarded_discover(region)
-            for region in session.get_authorized_regions()
-        ]
-        
-        region_results = await asyncio.gather(*region_tasks, return_exceptions=True)
-        
-        # Flatten results
-        all_instances = []
-        for result in region_results:
-            if isinstance(result, list):
-                all_instances.extend(result)
-            elif isinstance(result, Exception):
-                logging.error(f"Region discovery failed: {result}")
-        
-        logging.info(f"Discovered {len(all_instances)} compute instances in compartment {compartment_id}")
-        return all_instances
+        return await discover_across_regions(
+            session, discover_in_region, cls.resource_type,
+            skip_unauthorized=skip_unauthorized,
+        )
     
     @classmethod
     async def _get_instance_details(cls, compute_client, instance_id: str) -> tuple[bool, Dict[str, Any]]:
@@ -378,6 +358,7 @@ class InstancePool(AbstractOCIResource, AsyncResourceMixin):
 
                 async def list_operation():
                     return await cls._run_oci_operation(
+                        oci.pagination.list_call_get_all_results,
                         compute_mgmt_client.list_instance_pools,
                         compartment_id=compartment_id
                     )
@@ -434,28 +415,10 @@ class InstancePool(AbstractOCIResource, AsyncResourceMixin):
 
             return pools
 
-        max_concurrent = getattr(session, "max_concurrent_regions", 5)
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        async def guarded_discover(region: str) -> List['InstancePool']:
-            async with semaphore:
-                return await discover_in_region(region)
-
-        region_tasks = [
-            guarded_discover(region)
-            for region in session.get_authorized_regions()
-        ]
-
-        region_results = await asyncio.gather(*region_tasks, return_exceptions=True)
-        all_pools: List[InstancePool] = []
-        for result in region_results:
-            if isinstance(result, list):
-                all_pools.extend(result)
-            elif isinstance(result, Exception):
-                logging.error(f"Region discovery failed: {result}")
-
-        logging.info(f"Discovered {len(all_pools)} instance pools in compartment {compartment_id}")
-        return all_pools
+        return await discover_across_regions(
+            session, discover_in_region, cls.resource_type,
+            skip_unauthorized=skip_unauthorized,
+        )
 
     async def disable_delete_protection(self) -> OperationResult:
         """Instance pools do not have delete protection."""

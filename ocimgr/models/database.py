@@ -13,7 +13,8 @@ from oci.exceptions import ServiceError
 
 from ..core import (
     AbstractOCIResource, AsyncResourceMixin, ResourceInfo, DeletionOrder,
-    register_resource_type, AsyncOCISession, OperationResult, ResourceStatus
+    register_resource_type, AsyncOCISession, OperationResult, ResourceStatus,
+    discover_across_regions
 )
 from ..utils import run_with_backoff
 
@@ -42,9 +43,9 @@ class AutonomousDatabase(AbstractOCIResource, AsyncResourceMixin):
             try:
                 database_client = await session.get_client('database', region)
                 
-                # Run list operation in thread pool
                 async def list_operation():
                     return await cls._run_oci_operation(
+                        oci.pagination.list_call_get_all_results,
                         database_client.list_autonomous_databases,
                         compartment_id=compartment_id
                     )
@@ -111,31 +112,10 @@ class AutonomousDatabase(AbstractOCIResource, AsyncResourceMixin):
         
             return databases
         
-        # Discover across all regions concurrently (with concurrency limit)
-        max_concurrent = getattr(session, "max_concurrent_regions", 5)
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        async def guarded_discover(region: str) -> List['AutonomousDatabase']:
-            async with semaphore:
-                return await discover_in_region(region)
-
-        region_tasks = [
-            guarded_discover(region)
-            for region in session.get_authorized_regions()
-        ]
-        
-        region_results = await asyncio.gather(*region_tasks, return_exceptions=True)
-        
-        # Flatten results
-        all_databases = []
-        for result in region_results:
-            if isinstance(result, list):
-                all_databases.extend(result)
-            elif isinstance(result, Exception):
-                logging.error(f"Region discovery failed: {result}")
-        
-        logging.info(f"Discovered {len(all_databases)} autonomous databases in compartment {compartment_id}")
-        return all_databases
+        return await discover_across_regions(
+            session, discover_in_region, cls.resource_type,
+            skip_unauthorized=skip_unauthorized,
+        )
     
     async def disable_delete_protection(self) -> OperationResult:
         """Disable delete protection for the autonomous database"""
@@ -361,10 +341,10 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                 # Use the correct client and method name
                 mysql_client = await session.get_client('mysql', region)
                 
-                # The correct method name in OCI SDK
                 async def list_operation():
                     return await cls._run_oci_operation(
-                        mysql_client.list_db_systems,  # This should be correct
+                        oci.pagination.list_call_get_all_results,
+                        mysql_client.list_db_systems,
                         compartment_id=compartment_id
                     )
 
@@ -408,7 +388,7 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
                         if heat_wave_response.data:
                             estimated_time += 600  # Additional 10 minutes for HeatWave
                             has_heat_wave = True
-                    except:
+                    except Exception:
                         pass  # No HeatWave cluster or error getting it
                     
                     # Collect metadata
@@ -446,31 +426,10 @@ class MySQLDBSystem(AbstractOCIResource, AsyncResourceMixin):
         
             return db_systems
         
-        # Discover across all regions concurrently (with concurrency limit)
-        max_concurrent = getattr(session, "max_concurrent_regions", 5)
-        semaphore = asyncio.Semaphore(max_concurrent)
-
-        async def guarded_discover(region: str) -> List['MySQLDBSystem']:
-            async with semaphore:
-                return await discover_in_region(region)
-
-        region_tasks = [
-            guarded_discover(region)
-            for region in session.get_authorized_regions()
-        ]
-        
-        region_results = await asyncio.gather(*region_tasks, return_exceptions=True)
-        
-        # Flatten results
-        all_db_systems = []
-        for result in region_results:
-            if isinstance(result, list):
-                all_db_systems.extend(result)
-            elif isinstance(result, Exception):
-                logging.error(f"Region discovery failed: {result}")
-        
-        logging.info(f"Discovered {len(all_db_systems)} MySQL DB systems in compartment {compartment_id}")
-        return all_db_systems
+        return await discover_across_regions(
+            session, discover_in_region, cls.resource_type,
+            skip_unauthorized=skip_unauthorized,
+        )
     
     async def disable_delete_protection(self) -> OperationResult:
         """Disable delete protection for the MySQL DB system"""

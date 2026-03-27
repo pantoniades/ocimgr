@@ -86,8 +86,14 @@ class CompartmentManager:
                 'lifecycle_state': root_compartment.lifecycle_state
             })
             
+        except oci.exceptions.ServiceError as e:
+            logging.error(
+                "Error listing compartments (status=%s, code=%s): %s",
+                e.status, e.code, e.message
+            )
+            raise
         except Exception as e:
-            logging.error(f"Error listing compartments: {e}")
+            logging.error("Error listing compartments: %s", e)
             raise
         
         logging.info(f"Found {len(compartments)} accessible compartments")
